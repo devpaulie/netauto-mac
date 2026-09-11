@@ -1,0 +1,16 @@
+# 빌드 산출물 — 릴리스에 첨부하고 저장소에는 넣지 않는다
+dist/
+build/
+
+# macOS
+.DS_Store
+._*
+
+# 편집기
+.vscode/
+.idea/
+*.swp
+
+# 로컬 설정 (실제 네트워크 정보가 들어갈 수 있음)
+*.local.json
+netauto.local.*

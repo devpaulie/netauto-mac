@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.devpaulie.netauto</string>
+
+	<!-- root 소유 경로에서 실행 (사용자 쓰기 가능 경로에 두면 권한 상승 위험) -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/netauto</string>
+		<string>apply</string>
+	</array>
+
+	<!-- 부팅·로드 직후 1회 적용 -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- 네트워크 변경 감지:
+	     resolv.conf 는 네트워크가 바뀔 때 configd가 갱신 → 사실상 즉시 트리거
+	     NetworkInterfaces.plist 는 인터페이스 추가/제거(USB LAN 연결 등)
+	     ※ preferences.plist 는 일부러 제외 — 우리가 쓰는 파일이라 자기 트리거 루프 유발 -->
+	<key>WatchPaths</key>
+	<array>
+		<string>/var/run/resolv.conf</string>
+		<string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+	</array>
+
+	<!-- 안전망: WatchPaths가 놓친 경우를 대비한 주기 확인.
+	     상태가 이미 일치하면 아무것도 쓰지 않고 즉시 종료하므로 비용 거의 없음 -->
+	<!-- 메뉴바 앱 → 데몬 요청 드롭박스.
+	     QueueDirectories 는 디렉터리가 비어있지 않으면 잡을 기동하고,
+	     비워질 때까지 재기동한다 (드롭박스 패턴 전용 primitive).
+	     앱은 root가 아니므로 여기에 요청 파일만 떨어뜨리고,
+	     실제 위치 전환은 root 데몬이 수행한다 → GUI에서 비밀번호가 뜨지 않는다.
+	     ※ state 파일은 이 디렉터리 밖에 있어 자기 트리거가 발생하지 않는다. -->
+	<key>QueueDirectories</key>
+	<array>
+		<string>/usr/local/var/netauto/queue</string>
+	</array>
+
+	<key>StartInterval</key>
+	<integer>30</integer>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/netauto.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/netauto.log</string>
+
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>

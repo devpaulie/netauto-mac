@@ -1,0 +1,775 @@
+#!/bin/bash
+# netauto — SSID 기반 macOS 네트워크 위치(Location) 자동 전환
+#
+# Wi-Fi SSID를 감지해 규칙표에 맞는 네트워크 위치로 전환한다.
+# 위치에는 IP 방식(DHCP/INFORM/수동) + DNS + 프록시 + 서비스 순서가
+# 전부 들어있으므로, 위치 하나만 바꾸면 유선/무선이 함께 맞춰진다.
+#
+# 사용자가 시스템 설정에서 직접 위치를 바꾸면 그 SSID에 머무는 동안은
+# 건드리지 않는다(수동 우선). 다른 네트워크로 이동하면 자동 재개.
+
+set -uo pipefail
+
+VERSION="2.5.0"
+
+CONF="${NETAUTO_CONF:-/usr/local/etc/netauto/config.json}"
+PLUTIL=/usr/bin/plutil
+STATE_DIR="${NETAUTO_STATE_DIR:-/usr/local/var/netauto}"
+STATE="$STATE_DIR/state"
+PAUSE_FLAG="$STATE_DIR/paused-until"
+DISABLE_FLAG="$STATE_DIR/disabled"
+LOCK_DIR="$STATE_DIR/lock"
+QUEUE_DIR="$STATE_DIR/queue"        # GUI → 데몬 요청 드롭박스 (launchd QueueDirectories)
+LOG="${NETAUTO_LOG:-/var/log/netauto.log}"
+
+NETWORKSETUP="${NETAUTO_NETWORKSETUP:-/usr/sbin/networksetup}"
+IPCONFIG="${NETAUTO_IPCONFIG:-/usr/sbin/ipconfig}"
+ID="${NETAUTO_ID:-/usr/bin/id}"
+
+# 옵션 기본값 (설정 파일의 options 로 덮어씀)
+OPT_NOTIFY="on"          # 전환 시 macOS 알림
+OPT_NO_WIFI="skip"       # skip|default — Wi-Fi 미연결 시 동작
+OPT_SSID_RETRY="5"       # SSID 감지 재시도 횟수(1초 간격)
+OPT_RESPECT_MANUAL="on"  # 사용자 수동 변경 존중
+
+# ── 로깅 ─────────────────────────────────────────────────────────────
+log() {
+  local msg="[$(/bin/date '+%Y-%m-%d %H:%M:%S')] $*"
+  if [ -w "$LOG" ] || { [ ! -e "$LOG" ] && [ -w "$(/usr/bin/dirname "$LOG")" ]; }; then
+    printf '%s\n' "$msg" >> "$LOG" 2>/dev/null
+  fi
+  [ -t 2 ] && printf '%s\n' "$msg" >&2
+  return 0
+}
+die() { log "오류: $*"; printf 'netauto: %s\n' "$*" >&2; exit 1; }
+
+# ── 설정 파일 (JSON) ─────────────────────────────────────────────────
+# plutil 이 JSON 을 그대로 읽으므로 외부 의존성이 없다.
+# 앱(사용자 권한)과 데몬(root)이 같은 파일을 공유한다.
+
+# 키 경로 하나를 읽는다. 없으면 빈 문자열 + 종료코드 0.
+cfg() { # $1=키경로 (예: options.notify, rules.0.ssid)
+  [ -r "$CONF" ] || return 0
+  "$PLUTIL" -extract "$1" raw -o - "$CONF" 2>/dev/null || true
+}
+
+cfg_valid() { [ -r "$CONF" ] && "$PLUTIL" -convert xml1 -o /dev/null "$CONF" >/dev/null 2>&1; }
+
+# 불리언 옵션 → on/off 문자열
+cfg_flag() { # $1=옵션명 $2=기본값(on|off)
+  case "$(cfg "options.$1")" in
+    true|1|yes|on)  printf 'on' ;;
+    false|0|no|off) printf 'off' ;;
+    *)              printf '%s' "$2" ;;
+  esac
+}
+
+load_options() {
+  local v
+  OPT_NOTIFY=$(cfg_flag notify on)
+  OPT_RESPECT_MANUAL=$(cfg_flag respect_manual on)
+  v=$(cfg options.no_wifi);    [ -n "$v" ] && OPT_NO_WIFI="$v"
+  v=$(cfg options.ssid_retry); [ -n "$v" ] && OPT_SSID_RETRY="$v"
+}
+
+# IP 처리 방식
+#   keep    건드리지 않는다 (지금 설정 그대로)
+#   dhcp    자동으로 받는다 (networksetup -setdhcp)
+#   manual  적힌 주소로 고정 (networksetup -setmanualwithdhcprouter)
+# 예전 설정(ip_mode 없음)은 ip 값이 있으면 manual, 없으면 keep 으로 본다.
+# 사람이 읽는 IP 모드 설명
+ip_mode_desc() { # $1=mode $2=ip
+  case "$1" in
+    dhcp)   printf 'IP 자동(DHCP)' ;;
+    manual) printf 'IP 고정 %s' "$2" ;;
+    keep)   printf 'IP 그대로' ;;
+    *)      printf '' ;;
+  esac
+}
+
+normalize_ip_mode() { # $1=ip_mode $2=ip
+  case "$1" in
+    dhcp|manual|keep) printf '%s' "$1" ;;
+    *) [ -n "$2" ] && printf 'manual' || printf 'keep' ;;
+  esac
+}
+
+# 규칙을 한 번만 읽어 캐시한다 (매 조회마다 plutil 을 다시 부르지 않도록).
+# 필드 구분은 0x1F(unit separator) — 위치 이름·IP 에 나타날 수 없고,
+# 탭과 달리 빈 필드가 IFS 규칙으로 합쳐지지 않는다.
+SEP=$(printf '\037')
+RULES_TSV=""
+load_rules() {
+  local i=0 ssid loc ip mode
+  RULES_TSV=""
+  while :; do
+    ssid=$("$PLUTIL" -extract "rules.$i.ssid" raw -o - "$CONF" 2>/dev/null) || break
+    loc=$(cfg "rules.$i.location")
+    ip=$(cfg "rules.$i.ip")
+    mode=$(normalize_ip_mode "$(cfg "rules.$i.ip_mode")" "$ip")
+    RULES_TSV="${RULES_TSV}${ssid}${SEP}${loc}${SEP}${mode}${SEP}${ip}
+"
+    i=$((i + 1))
+  done
+}
+
+# SSID → "위치<SEP>ip_mode<SEP>IP". 정확히 일치하는 규칙이 없으면 '*' 규칙.
+rule_lookup() { # $1=ssid
+  [ -n "$RULES_TSV" ] || load_rules
+  printf '%s' "$RULES_TSV" | /usr/bin/awk -F"$SEP" -v want="$1" -v sep="$SEP" '
+    $1 == want { printf "%s%s%s%s%s", $2, sep, $3, sep, $4; found = 1; exit }
+    $1 == "*"  { d2 = $2; d3 = $3; d4 = $4 }
+    END { if (!found && d2 != "") printf "%s%s%s%s%s", d2, sep, d3, sep, d4 }'
+}
+
+# rule_lookup 결과를 RL_LOC / RL_MODE / RL_IP 로 분해 (빈 필드 안전)
+RL_LOC=""; RL_MODE=""; RL_IP=""
+split_rule() { # $1=rule 문자열
+  local r="$1" rest
+  if [ -z "$r" ]; then RL_LOC=""; RL_MODE=""; RL_IP=""; return 0; fi
+  RL_LOC="${r%%${SEP}*}"
+  rest="${r#*${SEP}}"
+  RL_MODE="${rest%%${SEP}*}"
+  RL_IP="${rest#*${SEP}}"
+}
+
+# 위치 이름 → 표시 이름 / 아이콘 (profiles 에서 조회, 없으면 위치 이름 그대로)
+profile_field() { # $1=위치이름 $2=label|icon
+  local i=0 loc v
+  while :; do
+    loc=$("$PLUTIL" -extract "profiles.$i.location" raw -o - "$CONF" 2>/dev/null) || break
+    if [ "$loc" = "$1" ]; then
+      v=$(cfg "profiles.$i.$2")
+      [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+      break
+    fi
+    i=$((i + 1))
+  done
+  [ "$2" = "label" ] && printf '%s' "$1" || printf ''
+}
+
+# ── 상태 파일 ────────────────────────────────────────────────────────
+ST_LAST_SSID=""; ST_LAST_LOCATION=""; ST_OVERRIDE_SSID=""; ST_APPLIED_AT=""
+
+state_load() {
+  [ -r "$STATE" ] || return 0
+  local line k v
+  while IFS= read -r line; do
+    k="${line%%=*}"; v="${line#*=}"
+    case "$k" in
+      last_ssid)     ST_LAST_SSID="$v" ;;
+      last_location) ST_LAST_LOCATION="$v" ;;
+      override_ssid) ST_OVERRIDE_SSID="$v" ;;
+      applied_at)    ST_APPLIED_AT="$v" ;;
+    esac
+  done < "$STATE"
+}
+
+state_save() {
+  # 상태는 데몬(root)만 기록한다. 앱이 사용자 권한으로 netauto 를 실행할 때
+  # 수동 지정 판정 근거를 덮어쓰지 않도록.
+  [ "$("$ID" -u)" = "0" ] || return 0
+  [ -d "$STATE_DIR" ] || /bin/mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  {
+    printf 'last_ssid=%s\n'     "$ST_LAST_SSID"
+    printf 'last_location=%s\n' "$ST_LAST_LOCATION"
+    printf 'override_ssid=%s\n' "$ST_OVERRIDE_SSID"
+    printf 'applied_at=%s\n'    "$ST_APPLIED_AT"
+  } > "$STATE.tmp" 2>/dev/null && /bin/mv -f "$STATE.tmp" "$STATE" 2>/dev/null
+  return 0
+}
+
+# ── 락 (동시 실행 방지, mkdir 기반 — macOS엔 flock 없음) ─────────────
+LOCK_HELD=0
+lock_acquire() {
+  local i=0 age now
+  while [ "$i" -lt 30 ]; do
+    if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then LOCK_HELD=1; return 0; fi
+    # 120초 넘은 고아 락은 회수
+    now=$(/bin/date +%s)
+    age=$(/usr/bin/stat -f %m "$LOCK_DIR" 2>/dev/null || echo "$now")
+    if [ $((now - age)) -gt 120 ]; then
+      log "고아 락 회수 (${age})"
+      /bin/rmdir "$LOCK_DIR" 2>/dev/null
+      continue
+    fi
+    /bin/sleep 1; i=$((i + 1))
+  done
+  return 1
+}
+lock_release() { [ "$LOCK_HELD" = "1" ] && /bin/rmdir "$LOCK_DIR" 2>/dev/null; LOCK_HELD=0; return 0; }
+trap lock_release EXIT INT TERM
+
+# ── 네트워크 조회 ────────────────────────────────────────────────────
+wifi_device() {
+  [ -n "${NETAUTO_WIFI_DEV:-}" ] && { printf '%s' "$NETAUTO_WIFI_DEV"; return 0; }
+  "$NETWORKSETUP" -listallhardwareports 2>/dev/null | /usr/bin/awk '
+    /^Hardware Port: Wi-Fi$/ { getline; if ($1 == "Device:") { print $2; exit } }'
+}
+
+wifi_power_on() { # $1=dev
+  local out
+  out=$("$NETWORKSETUP" -getairportpower "$1" 2>/dev/null)
+  case "$out" in *": On"*) return 0 ;; *) return 1 ;; esac
+}
+
+# SSID 감지. networksetup 우선, 실패 시 ipconfig로 폴백. (airport -I는 14.4에서 폐기)
+current_ssid() { # $1=dev
+  local dev="$1" s="" i=0 tries="$OPT_SSID_RETRY"
+  wifi_power_on "$dev" || return 1
+  while :; do
+    s=$("$NETWORKSETUP" -getairportnetwork "$dev" 2>/dev/null \
+        | /usr/bin/sed -n 's/^Current Wi-Fi Network: //p')
+    if [ -z "$s" ]; then
+      s=$("$IPCONFIG" getsummary "$dev" 2>/dev/null \
+          | /usr/bin/awk -F' SSID : ' '/ SSID : /{print $2; exit}')
+    fi
+    [ -n "$s" ] && { printf '%s' "$s"; return 0; }
+    i=$((i + 1)); [ "$i" -ge "$tries" ] && return 1
+    /bin/sleep 1
+  done
+}
+
+current_location() { "$NETWORKSETUP" -getcurrentlocation 2>/dev/null; }
+
+# en0 같은 장치명에 대응하는 네트워크 서비스 이름(예: "Wi-Fi").
+# 위치마다 서비스 이름이 다를 수 있으므로 하드코딩하지 않는다.
+service_for_device() { # $1=dev
+  "$NETWORKSETUP" -listnetworkserviceorder 2>/dev/null | /usr/bin/awk -v d="$1" '
+    /^\([0-9*]+\)/ { name = $0; sub(/^\([0-9*]+\)[[:space:]]*/, "", name) }
+    index($0, "Device: " d ")") > 0 { print name; exit }'
+}
+
+location_exists() { # $1=이름
+  "$NETWORKSETUP" -listlocations 2>/dev/null | /usr/bin/grep -Fxq "$1"
+}
+
+# ── 알림 (root 데몬 → 콘솔 사용자 세션으로 전달) ─────────────────────
+notify() { # $1=제목 $2=본문
+  [ "$OPT_NOTIFY" = "on" ] || return 0
+  local uid title body
+  uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null) || return 0
+  [ -n "$uid" ] && [ "$uid" != "0" ] || return 0
+  title=$(printf '%s' "$1" | /usr/bin/tr -d '"\\')
+  body=$(printf '%s' "$2" | /usr/bin/tr -d '"\\')
+  if [ "$("$ID" -u)" = "0" ]; then
+    /bin/launchctl asuser "$uid" /usr/bin/osascript \
+      -e "display notification \"$body\" with title \"$title\"" >/dev/null 2>&1
+  else
+    /usr/bin/osascript -e "display notification \"$body\" with title \"$title\"" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# ── 요청 큐 (GUI는 root가 아니므로 데몬에 작업을 요청한다) ───────────
+# launchd QueueDirectories 가 이 디렉터리를 감시 → 파일이 생기면 데몬을 즉시 기동.
+# 데몬은 요청을 읽고 반드시 삭제한다 (안 지우면 launchd가 계속 재기동한다).
+queue_available() { [ -d "$QUEUE_DIR" ] && [ -w "$QUEUE_DIR" ]; }
+
+enqueue() { # $* = 요청 문자열
+  queue_available || return 1
+  local f="$QUEUE_DIR/req.$$.$(/bin/date +%s)"
+  printf '%s\n' "$*" > "$f.part" 2>/dev/null || return 1
+  /bin/mv -f "$f.part" "$f" 2>/dev/null || return 1   # 원자적 등장
+  log "요청 접수: $*"
+  return 0
+}
+
+# 큐를 비우고 요청을 해석한다. 결과를 표준출력으로 반환:
+#   ""            요청 없음
+#   "force"       강제 적용
+#   "pick<TAB>위치" 특정 위치로 수동 전환
+drain_queue() {
+  [ -d "$QUEUE_DIR" ] || return 0
+  local f line verdict=""
+  for f in "$QUEUE_DIR"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *.part) continue ;; esac
+    line=$(/usr/bin/head -1 "$f" 2>/dev/null)
+    /bin/rm -f "$f" 2>/dev/null
+    case "$line" in
+      force)      verdict="force" ;;
+      pick\ *)    verdict="pick	${line#pick }" ;;
+      setip\ *)   verdict="setip	${line#setip }" ;;
+      setdhcp)    verdict="setdhcp" ;;
+      apply)      [ -n "$verdict" ] || verdict="apply" ;;
+      *)       log "알 수 없는 요청 무시: $line" ;;
+    esac
+  done
+  printf '%s' "$verdict"
+}
+
+# 위치 전환 실행부. cmd_apply 와 cmd_pick 이 공유한다.
+# $1=대상 위치  $2=현재 위치  $3=ssid  $4=manual(1이면 수동 지정으로 표시)
+apply_location() {
+  local want="$1" cur="$2" ssid="$3" manual="${4:-0}"
+  location_exists "$want" || die "네트워크 위치 '${want}'가 없습니다. networksetup -listlocations 확인"
+
+  if [ "$("$ID" -u)" != "0" ]; then
+    if enqueue "$([ "$manual" = "1" ] && printf 'pick %s' "$want" || printf 'force')"; then
+      printf "요청을 전달했습니다 — 데몬이 곧 '%s'(으)로 전환합니다\n" "$want"; return 0
+    fi
+    die "위치 전환은 root 권한이 필요합니다 (sudo 로 실행)"
+  fi
+
+  lock_acquire || { log "건너뜀: 락 획득 실패"; return 0; }
+  if "$NETWORKSETUP" -switchtolocation "$want" >/dev/null 2>&1; then
+    ST_LAST_SSID="$ssid"; ST_LAST_LOCATION="$want"
+    [ "$manual" = "1" ] && ST_OVERRIDE_SSID="$ssid" || ST_OVERRIDE_SSID=""
+    ST_APPLIED_AT=$(/bin/date +%s); state_save
+    if [ "$manual" = "1" ]; then
+      log "수동 전환: SSID '${ssid}' → 위치 '${cur}' → '${want}' (이 네트워크에서 유지)"
+      notify "네트워크 프로필 수동 전환" "${want} — ${ssid}에서 유지"
+    else
+      log "전환 완료: SSID '${ssid}' → 위치 '${cur}' → '${want}'"
+      notify "네트워크 프로필 전환" "${ssid} → ${want}"
+    fi
+    lock_release; return 0
+  fi
+  log "전환 실패: '${want}' (networksetup -switchtolocation 오류)"
+  lock_release; return 1
+}
+
+# ── IP 적용 ──────────────────────────────────────────────────────────
+# 규칙에 IP가 적혀 있으면 그 주소를 고정한다.
+# -setmanualwithdhcprouter = ConfigMethod INFORM = 시스템 설정의
+# "DHCP 사용(수동 주소)" — 주소만 고정하고 서브넷·라우터는 DHCP에서 받는다.
+# (사내 프로필이 원래 쓰던 방식과 같다)
+current_ip() { "$IPCONFIG" getifaddr "$1" 2>/dev/null; }
+
+# 현재 IPv4 설정 방식이 자동(DHCP)인가 — 멱등성 판단용
+is_dhcp() { # $1=service
+  case "$("$NETWORKSETUP" -getinfo "$1" 2>/dev/null | /usr/bin/sed -n '1p')" in
+    DHCP\ Configuration*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# IPv4 설정을 원하는 방식으로 맞춘다.
+#   keep   → 아무것도 하지 않음 (지금 설정 그대로)
+#   dhcp   → 자동으로 받게. 이미 자동이면 아무것도 쓰지 않는다
+#   manual → 적힌 주소로 고정. ConfigMethod INFORM = 시스템 설정의
+#            "DHCP 사용(수동 주소)" — 주소만 고정하고 서브넷·라우터는 DHCP에서 받는다
+ensure_ipv4() { # $1=dev $2=mode $3=ip
+  local dev="$1" mode="$2" ip="$3" svc cur
+  [ -n "$mode" ] || return 0
+  [ "$mode" = "keep" ] && return 0
+
+  svc=$(service_for_device "$dev")
+  [ -n "$svc" ] || { log "IP 설정 실패: '$dev' 의 네트워크 서비스를 찾을 수 없음"; return 1; }
+
+  if [ "$mode" = "dhcp" ]; then
+    is_dhcp "$svc" && return 0
+    if [ "$("$ID" -u)" != "0" ]; then
+      enqueue "setdhcp" && return 0
+      log "IP 설정 보류: root 권한 필요"; return 1
+    fi
+    if "$NETWORKSETUP" -setdhcp "$svc" >/dev/null 2>&1; then
+      log "IP 자동(DHCP)으로 변경 (${svc})"
+      notify "IP 설정" "자동 (DHCP)"
+      return 0
+    fi
+    log "IP 자동 전환 실패 (${svc})"; return 1
+  fi
+
+  # manual
+  [ -n "$ip" ] || { log "건너뜀: 고정 IP 모드인데 주소가 비어 있음"; return 0; }
+  cur=$(current_ip "$dev")
+  if [ "$cur" = "$ip" ] && ! is_dhcp "$svc"; then return 0; fi
+
+  if [ "$("$ID" -u)" != "0" ]; then
+    enqueue "setip $ip" && return 0
+    log "IP 설정 보류: root 권한 필요"; return 1
+  fi
+  if "$NETWORKSETUP" -setmanualwithdhcprouter "$svc" "$ip" >/dev/null 2>&1; then
+    log "IP 고정: ${cur:-없음} → ${ip} (${svc}, DHCP 수동 주소)"
+    notify "IP 변경" "$ip"
+    return 0
+  fi
+  log "IP 고정 실패: '$ip'"; return 1
+}
+
+# ── 일시중지 / 비활성 ────────────────────────────────────────────────
+is_disabled() { [ -e "$DISABLE_FLAG" ]; }
+pause_remaining() { # 남은 초 출력, 일시중지 아니면 빈 값
+  [ -r "$PAUSE_FLAG" ] || return 0
+  local until now; until=$(/bin/cat "$PAUSE_FLAG" 2>/dev/null); now=$(/bin/date +%s)
+  case "$until" in ''|*[!0-9]*) /bin/rm -f "$PAUSE_FLAG"; return 0 ;; esac
+  if [ "$now" -ge "$until" ]; then /bin/rm -f "$PAUSE_FLAG"; return 0; fi
+  printf '%s' $((until - now))
+}
+
+# ── 핵심: 규칙 적용 ──────────────────────────────────────────────────
+cmd_apply() { # $1=force(1이면 우선순위·수동존중 무시)
+  local force="${1:-0}" dev ssid cur want want_ip rule rem req pick="" setip=""
+  load_options
+  state_load
+
+  # GUI가 남긴 요청을 먼저 소비한다. 사용자가 메뉴에서 직접 누른 것이므로
+  # 일시중지·비활성보다 우선한다.
+  req=$(drain_queue)
+  case "$req" in
+    force)   force=1 ;;
+    pick*)   pick="${req#pick	}"; force=1 ;;
+    setip*)  setip="${req#setip	}"; force=1 ;;
+    setdhcp) setip="__dhcp__"; force=1 ;;
+  esac
+
+  if [ "$force" != "1" ]; then
+    if is_disabled; then log "건너뜀: 비활성 상태 (netauto on 으로 재개)"; return 0; fi
+    rem=$(pause_remaining)
+    if [ -n "$rem" ]; then log "건너뜀: 일시중지 ${rem}초 남음"; return 0; fi
+  fi
+
+  dev=$(wifi_device); [ -n "$dev" ] || die "Wi-Fi 인터페이스를 찾을 수 없습니다"
+
+  if ! ssid=$(current_ssid "$dev"); then
+    if [ "$OPT_NO_WIFI" = "skip" ]; then
+      log "건너뜀: Wi-Fi 미연결 (no_wifi=skip)"; return 0
+    fi
+    ssid=""
+  fi
+
+  cur=$(current_location)
+  [ -n "$cur" ] || die "현재 네트워크 위치를 읽을 수 없습니다"
+
+  # GUI에서 IP를 직접 고른 경우: 현재 프로필에 그대로 적용한다.
+  if [ -n "$setip" ]; then
+    if [ "$setip" = "__dhcp__" ]; then ensure_ipv4 "$dev" dhcp ""
+    else ensure_ipv4 "$dev" manual "$setip"; fi
+    return $?
+  fi
+
+  # GUI에서 특정 위치를 고른 경우: 규칙을 무시하고 그 위치로 전환하고
+  # '수동 지정'으로 표시해 이 네트워크에 있는 동안 자동이 양보하게 한다.
+  if [ -n "$pick" ]; then
+    if [ "$cur" = "$pick" ]; then
+      ST_LAST_SSID="$ssid"; ST_LAST_LOCATION="$pick"; ST_OVERRIDE_SSID="$ssid"
+      ST_APPLIED_AT=$(/bin/date +%s); state_save
+      log "수동 지정: '${ssid}' → 위치 '${pick}' (이미 일치, 유지 표시만)"
+      return 0
+    fi
+    apply_location "$pick" "$cur" "$ssid" 1
+    return $?
+  fi
+
+  split_rule "$(rule_lookup "$ssid")"
+  want="$RL_LOC"; want_mode="$RL_MODE"; want_ip="$RL_IP"
+  [ -n "$want" ] || { log "건너뜀: '${ssid}'에 맞는 규칙이 없음"; return 0; }
+
+  # 1) 이미 원하는 상태면 아무것도 쓰지 않는다.
+  #    위치를 바꾸면 resolv.conf 가 갱신되어 WatchPaths 가 우리를 다시 깨우므로,
+  #    이 조기 반환이 자기 트리거 루프를 끊는 지점이다.
+  #    (여기서 수동 지정도 해제된다 — 사용자가 규칙과 같은 값으로 되돌린 경우)
+  if [ "$cur" = "$want" ]; then
+    if [ "$ST_LAST_SSID" != "$ssid" ] || [ "$ST_LAST_LOCATION" != "$want" ] || [ -n "$ST_OVERRIDE_SSID" ]; then
+      ST_LAST_SSID="$ssid"; ST_LAST_LOCATION="$want"; ST_OVERRIDE_SSID=""
+      ST_APPLIED_AT=$(/bin/date +%s); state_save
+    fi
+    log "변경 없음: '${ssid}' → 위치 '${cur}' (이미 일치)"
+    ensure_ipv4 "$dev" "$want_mode" "$want_ip"   # 프로필은 맞아도 IP 설정은 다를 수 있다
+    return 0
+  fi
+
+  # 2) 사용자 수동 변경 존중. 여기 도달했으면 cur != want 가 보장된다.
+  #    같은 SSID에 머무는 중인데 현재 위치가 우리가 설정한 값과 다르면 사람이 바꾼 것
+  #    → 그 SSID를 벗어날 때까지 손대지 않는다.
+  #    로그는 감지 시점 한 번만 남긴다 (30초 주기 실행이라 매번 남기면 로그가 넘친다).
+  #    유지 중인지는 netauto status 로 확인.
+  if [ "$force" != "1" ] && [ "$OPT_RESPECT_MANUAL" = "on" ] && [ -n "$ssid" ]; then
+    if [ "$ST_OVERRIDE_SSID" != "$ssid" ] && [ -n "$ST_LAST_LOCATION" ] \
+       && [ "$ssid" = "$ST_LAST_SSID" ] && [ "$cur" != "$ST_LAST_LOCATION" ]; then
+      log "수동 변경 감지: '${ssid}'에서 위치가 '${ST_LAST_LOCATION}' → '${cur}'. 이 네트워크에 있는 동안 유지합니다. (해제: netauto apply --force)"
+      ST_OVERRIDE_SSID="$ssid"; state_save
+    fi
+    [ "$ST_OVERRIDE_SSID" = "$ssid" ] && return 0
+  fi
+
+  apply_location "$want" "$cur" "$ssid" 0 || return 1
+  ensure_ipv4 "$dev" "$want_mode" "$want_ip"
+}
+
+# GUI 메뉴에서 위치를 직접 고른 경우
+cmd_pick() { # $1=위치이름
+  local loc="${1:-}" dev ssid cur
+  [ -n "$loc" ] || die "위치 이름을 주세요: netauto pick Office"
+  load_options; load_rules; state_load
+  location_exists "$loc" || die "네트워크 위치 '${loc}'가 없습니다"
+  dev=$(wifi_device); ssid=$(current_ssid "$dev" 2>/dev/null) || ssid=""
+  cur=$(current_location)
+  if [ "$cur" = "$loc" ] && [ "$("$ID" -u)" = "0" ]; then
+    ST_LAST_SSID="$ssid"; ST_LAST_LOCATION="$loc"; ST_OVERRIDE_SSID="$ssid"
+    ST_APPLIED_AT=$(/bin/date +%s); state_save
+    printf "이미 '%s' 입니다 — 수동 지정으로 표시했습니다\n" "$loc"; return 0
+  fi
+  apply_location "$loc" "$cur" "$ssid" 1
+}
+
+# ── 서브커맨드 ───────────────────────────────────────────────────────
+cmd_status() {
+  load_options; load_rules; state_load
+  local dev ssid cur want want_mode want_ip rem lbl ip i desc
+  dev=$(wifi_device)
+  ssid=$(current_ssid "$dev" 2>/dev/null) || ssid="(미연결)"
+  cur=$(current_location)
+  split_rule "$(rule_lookup "$ssid")"
+  want="$RL_LOC"; want_mode="$RL_MODE"; want_ip="$RL_IP"
+  rem=$(pause_remaining)
+  lbl=$(profile_field "$cur" label)
+
+  printf 'netauto %s\n\n' "$VERSION"
+  printf '  현재 Wi-Fi     : %s\n' "$ssid"
+  printf '  현재 프로필    : %s%s\n' "$cur" "$([ "$lbl" != "$cur" ] && printf ' (%s)' "$lbl")"
+  printf '  현재 IP        : %s\n' "$(current_ip "$dev")"
+  desc=$(ip_mode_desc "$want_mode" "$want_ip")
+  printf '  규칙상 프로필  : %s%s\n' "${want:-(규칙 없음)}" "${desc:+ + $desc}"
+  printf '\n'
+  if is_disabled;                        then printf '  상태           : 자동 전환 꺼짐 (netauto on)\n'
+  elif [ -n "$rem" ];                    then printf '  상태           : 일시중지 (%s분 남음)\n' $((rem / 60 + 1))
+  elif [ "$ST_OVERRIDE_SSID" = "$ssid" ] && [ -n "$ssid" ]; then
+    printf "  상태           : 수동 지정 유지 중 ('%s')\n" "$ssid"
+  else                                        printf '  상태           : 자동 (활성)\n'; fi
+  printf '  마지막 적용    : %s\n' \
+    "$([ -n "$ST_APPLIED_AT" ] && /bin/date -r "$ST_APPLIED_AT" '+%m-%d %H:%M:%S' || echo '-')"
+
+  printf '\n  규칙 (%s):\n' "$CONF"
+  if [ -n "$RULES_TSV" ]; then
+    printf '%s' "$RULES_TSV" | /usr/bin/awk -F"$SEP" '
+      NF >= 3 { m = ($3 == "dhcp" ? "IP 자동" : ($3 == "manual" ? "IP 고정 " $4 : "IP 그대로"))
+                printf "    %-24s → %-14s %s\n", $1, $2, m }'
+  else
+    printf '    (규칙 없음 — 설정 파일을 확인하세요)\n'
+  fi
+
+  printf '\n  저장된 IP:\n'
+  i=0
+  while :; do
+    lbl=$("$PLUTIL" -extract "saved_ips.$i.label" raw -o - "$CONF" 2>/dev/null) || break
+    ip=$(cfg "saved_ips.$i.ip")
+    printf '    %-24s %s\n' "$lbl" "$ip"
+    i=$((i + 1))
+  done
+  [ "$i" = "0" ] && printf '    (없음)\n'
+  return 0
+}
+
+# JSON 문자열 이스케이프 (SSID·위치명에 " 나 \ 가 있어도 안전)
+json_esc() {
+  printf '%s' "${1:-}" | /usr/bin/sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+    -e 's/\t/\\t/g' -e 's/\r//g' | /usr/bin/tr -d '\n'
+}
+
+# 메뉴바 앱이 읽는 기계용 상태. root 권한 없이 동작한다.
+cmd_status_json() {
+  load_options; load_rules; state_load
+  local dev svc ssid connected cur want want_mode want_ip def state rem info ipcfg ip router pac locs first i l
+  dev=$(wifi_device)
+  if ssid=$(current_ssid "$dev" 2>/dev/null); then connected=true; else ssid=""; connected=false; fi
+  cur=$(current_location)
+  split_rule "$(rule_lookup "$ssid")"
+  want="$RL_LOC"; want_mode="$RL_MODE"; want_ip="$RL_IP"
+  split_rule "$(rule_lookup "__netauto_no_such_ssid__")"; def="$RL_LOC"
+  rem=$(pause_remaining); [ -n "$rem" ] || rem=0
+
+  if is_disabled;                                        then state="disabled"
+  elif [ "$rem" -gt 0 ] 2>/dev/null;                     then state="paused"
+  elif [ "$connected" = "false" ];                       then state="nowifi"
+  elif [ -n "$ssid" ] && [ "$ST_OVERRIDE_SSID" = "$ssid" ]; then state="manual"
+  else                                                        state="auto"; fi
+
+  svc=$(service_for_device "$dev")
+  if [ -n "$svc" ]; then
+    info=$("$NETWORKSETUP" -getinfo "$svc" 2>/dev/null)
+    ipcfg=$(printf '%s' "$info" | /usr/bin/sed -n '1p' | /usr/bin/sed 's/[[:space:]]*$//')
+    ip=$(printf '%s' "$info" | /usr/bin/sed -n 's/^IP address: //p' | /usr/bin/head -1)
+    router=$(printf '%s' "$info" | /usr/bin/sed -n 's/^Router: //p' | /usr/bin/head -1)
+    pac=$("$NETWORKSETUP" -getautoproxyurl "$svc" 2>/dev/null \
+          | /usr/bin/sed -n 's/^URL: //p' | /usr/bin/head -1)
+    [ "$pac" = "(null)" ] && pac=""
+  fi
+
+  printf '{\n'
+  printf '  "version": "%s",\n'            "$(json_esc "$VERSION")"
+  printf '  "wifi_device": "%s",\n'        "$(json_esc "$dev")"
+  printf '  "ssid": "%s",\n'               "$(json_esc "$ssid")"
+  printf '  "connected": %s,\n'            "$connected"
+  printf '  "location": "%s",\n'           "$(json_esc "$cur")"
+  printf '  "expected_location": "%s",\n'  "$(json_esc "$want")"
+  printf '  "expected_ip": "%s",\n'         "$(json_esc "$want_ip")"
+  printf '  "expected_ip_mode": "%s",\n'    "$(json_esc "$want_mode")"
+  printf '  "ipv4_is_dhcp": %s,\n'          "$([ -n "$svc" ] && is_dhcp "$svc" && echo true || echo false)"
+  printf '  "label": "%s",\n'               "$(json_esc "$(profile_field "$cur" label)")"
+  printf '  "icon": "%s",\n'                "$(json_esc "$(profile_field "$cur" icon)")"
+  printf '  "menubar_text": %s,\n'          "$([ "$(cfg_flag menubar_text on)" = "on" ] && echo true || echo false)"
+  printf '  "default_location": "%s",\n'   "$(json_esc "$def")"
+  printf '  "state": "%s",\n'              "$state"
+  printf '  "pause_remaining": %s,\n'      "$rem"
+  printf '  "applied_at": %s,\n'           "${ST_APPLIED_AT:-0}"
+  printf '  "ipv4_config": "%s",\n'        "$(json_esc "${ipcfg:-}")"
+  printf '  "ipv4_address": "%s",\n'       "$(json_esc "${ip:-}")"
+  printf '  "router": "%s",\n'             "$(json_esc "${router:-}")"
+  printf '  "pac_url": "%s",\n'            "$(json_esc "${pac:-}")"
+  printf '  "conf": "%s",\n'               "$(json_esc "$CONF")"
+  printf '  "conf_valid": %s,\n'            "$(cfg_valid && echo true || echo false)"
+  printf '  "log": "%s",\n'                "$(json_esc "$LOG")"
+  printf '  "queue_ready": %s,\n'          "$(queue_available && echo true || echo false)"
+  printf '  "locations": ['
+  locs=$("$NETWORKSETUP" -listlocations 2>/dev/null)
+  first=1
+  printf '%s\n' "$locs" | while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    [ "$first" = "1" ] && first=0 || printf ', '
+    printf '"%s"' "$(json_esc "$l")"
+  done
+  printf '],\n'
+
+  # 저장된 IP 목록 (앱 메뉴에서 바로 고를 수 있도록)
+  printf '  "saved_ips": ['
+  first=1; i=0
+  while :; do
+    l=$("$PLUTIL" -extract "saved_ips.$i.label" raw -o - "$CONF" 2>/dev/null) || break
+    [ "$first" = "1" ] && first=0 || printf ', '
+    printf '{"label": "%s", "ip": "%s"}' "$(json_esc "$l")" "$(json_esc "$(cfg "saved_ips.$i.ip")")"
+    i=$((i + 1))
+  done
+  printf '],\n'
+
+  # 프로필 이름표 (메뉴바에 Office / Auto 로 표시하기 위함)
+  printf '  "profiles": ['
+  first=1; i=0
+  while :; do
+    l=$("$PLUTIL" -extract "profiles.$i.location" raw -o - "$CONF" 2>/dev/null) || break
+    [ "$first" = "1" ] && first=0 || printf ', '
+    printf '{"location": "%s", "label": "%s", "icon": "%s"}' \
+      "$(json_esc "$l")" "$(json_esc "$(cfg "profiles.$i.label")")" "$(json_esc "$(cfg "profiles.$i.icon")")"
+    i=$((i + 1))
+  done
+  printf ']\n}\n'
+}
+
+cmd_pause() {
+  local mins="${1:-60}" until
+  case "$mins" in ''|*[!0-9]*) die "분 단위 숫자를 주세요: netauto pause 60" ;; esac
+  /bin/mkdir -p "$STATE_DIR" 2>/dev/null || die "상태 디렉터리 접근 불가: $STATE_DIR (sudo 필요)"
+  until=$(( $(/bin/date +%s) + mins * 60 ))
+  printf '%s\n' "$until" > "$PAUSE_FLAG" || die "일시중지 설정 실패 (sudo 필요)"
+  log "일시중지 ${mins}분"
+  printf '%s분간 자동 전환을 멈춥니다 (%s까지)\n' "$mins" "$(/bin/date -r "$until" '+%H:%M')"
+}
+cmd_resume() {
+  /bin/rm -f "$PAUSE_FLAG" 2>/dev/null || die "sudo 필요"
+  log "일시중지 해제"
+  # 데몬의 다음 주기(최대 30초)를 기다리지 않고 바로 재적용시킨다
+  enqueue "apply" 2>/dev/null || true
+  echo "자동 전환 재개"
+}
+cmd_off() {
+  /bin/mkdir -p "$STATE_DIR" 2>/dev/null
+  : > "$DISABLE_FLAG" 2>/dev/null || die "sudo 필요"
+  log "비활성화"; echo "netauto 비활성화 (설정은 그대로 유지)"
+}
+cmd_on() {
+  /bin/rm -f "$DISABLE_FLAG" 2>/dev/null || die "sudo 필요"
+  log "활성화"
+  enqueue "apply" 2>/dev/null || true
+  echo "netauto 활성화"
+}
+
+cmd_test() { # 드라이런: SSID를 가정해 어떤 프로필/IP가 선택되는지만 출력
+  local ssid="${1:-}" want want_mode want_ip desc
+  [ -n "$ssid" ] || die "Wi-Fi 이름을 주세요: netauto test OfficeWiFi"
+  load_options; load_rules
+  split_rule "$(rule_lookup "$ssid")"
+  want="$RL_LOC"; want_mode="$RL_MODE"; want_ip="$RL_IP"
+  desc=$(ip_mode_desc "$want_mode" "$want_ip")
+  printf "Wi-Fi '%s' → 프로필 '%s'%s\n" "$ssid" "${want:-(규칙 없음 · 아무것도 안 함)}" "${desc:+ + $desc}"
+  [ -n "$want" ] && { location_exists "$want" \
+    && printf "  프로필 '%s' 존재 확인 ✓\n" "$want" \
+    || printf "  경고: 네트워크 위치 '%s'가 시스템에 없습니다 ✗\n" "$want"; }
+  return 0
+}
+
+# IP를 자동(DHCP)으로 되돌린다
+cmd_setdhcp() {
+  local dev
+  load_options
+  dev=$(wifi_device); [ -n "$dev" ] || die "Wi-Fi 인터페이스를 찾을 수 없습니다"
+  if ensure_ipv4 "$dev" dhcp ""; then
+    [ "$("$ID" -u)" = "0" ] && echo "IP 를 자동(DHCP)으로 설정했습니다" \
+                            || echo "요청을 전달했습니다 — 곧 자동(DHCP)으로 바뀝니다"
+  else
+    die "자동(DHCP) 전환 실패"
+  fi
+}
+
+# 저장된 IP를 현재 프로필에 적용
+cmd_setip() { # $1=IP
+  local ip="${1:-}" dev
+  [ -n "$ip" ] || die "IP를 주세요: netauto setip 192.168.10.50"
+  case "$ip" in
+    *[!0-9.]*|.*|*..*) die "IP 형식이 아닙니다: $ip" ;;
+  esac
+  load_options
+  dev=$(wifi_device); [ -n "$dev" ] || die "Wi-Fi 인터페이스를 찾을 수 없습니다"
+  if ensure_ipv4 "$dev" manual "$ip"; then
+    [ "$("$ID" -u)" = "0" ] && printf "IP 를 %s 로 설정했습니다\n" "$ip" \
+                            || printf "요청을 전달했습니다 — 곧 %s 로 설정됩니다\n" "$ip"
+  else
+    die "IP 설정 실패: $ip"
+  fi
+}
+
+# 설정 창에서 Wi-Fi 이름을 고를 수 있도록 알려진 SSID 목록을 출력한다.
+# 현재 접속 중인 것을 맨 앞에 둔다.
+cmd_ssids() {
+  local dev cur
+  dev=$(wifi_device)
+  cur=$(current_ssid "$dev" 2>/dev/null) || cur=""
+  [ -n "$cur" ] && printf '%s\n' "$cur"
+  "$NETWORKSETUP" -listpreferredwirelessnetworks "$dev" 2>/dev/null \
+    | /usr/bin/sed -n 's/^\t//p' | /usr/bin/awk -v c="$cur" '$0 != c && NF'
+}
+
+cmd_log() { [ -r "$LOG" ] && /usr/bin/tail -n "${1:-40}" "$LOG" || echo "로그 없음: $LOG"; }
+
+usage() {
+  /bin/cat <<'USAGE'
+netauto — SSID 기반 macOS 네트워크 위치 자동 전환
+
+사용법:
+  netauto status              현재 SSID · 위치 · 규칙 · 상태 보기
+  netauto status --json       기계용 상태 (메뉴바 앱이 사용)
+  netauto pick <프로필>       특정 프로필로 수동 전환 (그 Wi-Fi에서는 자동이 양보)
+  netauto setip <IP>          현재 프로필의 IP를 그 주소로 고정
+  netauto setdhcp             현재 프로필의 IP를 자동(DHCP)으로
+  netauto apply               지금 규칙 적용 (sudo 필요)
+  netauto apply --force       수동 지정·일시중지 무시하고 강제 적용 (sudo)
+  netauto test <SSID>         해당 SSID면 어떤 위치가 될지 확인 (변경 안 함)
+  netauto pause [분]          자동 전환 일시중지 (기본 60분, sudo)
+  netauto resume              일시중지 해제 (sudo)
+  netauto off | on            완전 비활성 / 재활성 (sudo)
+  netauto log [줄수]          로그 보기 (기본 40줄)
+
+설정: /usr/local/etc/netauto/config.json  (메뉴바 앱의 "설정…" 에서 편집)
+USAGE
+}
+
+# ── 진입점 ───────────────────────────────────────────────────────────
+case "${1:-apply}" in
+  apply)  shift || true; [ "${1:-}" = "--force" ] && cmd_apply 1 || cmd_apply 0 ;;
+  status) shift || true
+          [ "${1:-}" = "--json" ] && cmd_status_json || cmd_status ;;
+  pick)   shift || true; cmd_pick "${1:-}" ;;
+  setip)  shift || true; cmd_setip "${1:-}" ;;
+  setdhcp) cmd_setdhcp ;;
+  test)   shift || true; cmd_test "${1:-}" ;;
+  pause)  shift || true; cmd_pause "${1:-60}" ;;
+  resume) cmd_resume ;;
+  off)    cmd_off ;;
+  on)     cmd_on ;;
+  log)    shift || true; cmd_log "${1:-40}" ;;
+  ssids)  cmd_ssids ;;
+  version|--version|-v) echo "netauto $VERSION" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 2 ;;
+esac

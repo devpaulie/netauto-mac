@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, "Apple SD Gothic Neo", sans-serif; color: #1d1d1f;
+         margin: 0; line-height: 1.65; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 0 0 12px; }
+  .box { background: #f5f5f7; border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; margin: 4px 0; }
+  .k { color: #6e6e73; min-width: 78px; }
+  .note { color: #6e6e73; font-size: 12px; }
+  .credit { color: #86868b; font-size: 11px; margin: 16px 0 0;
+            border-top: 1px solid #e5e5ea; padding-top: 10px; }
+  {{ICON_CSS}}
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f7; }
+    .box { background: #2c2c2e; }
+    .k, .note { color: #98989d; }
+    .credit { color: #8e8e93; border-top-color: #3a3a3c; }
+  }
+</style>
+<h2>netauto 설치</h2>
+<p>Wi-Fi에 따라 네트워크 설정을 자동으로 바꿔주는 프로그램입니다.
+사무실 Wi-Fi에 붙으면 사내 설정(고정 IP·프록시)으로, 집이나 카페에서는 일반 설정으로
+알아서 전환됩니다.</p>
+
+<div class="box">
+  <div class="row"><span class="k">메뉴바</span><span>지금 어떤 설정인지 항상 표시됩니다</span></div>
+  <div class="row"><span class="k">설정 창</span><span>Wi-Fi 규칙과 자주 쓰는 IP를 직접 추가할 수 있습니다</span></div>
+  <div class="row"><span class="k">수동 조작</span><span>직접 바꾸면 자동 전환이 그 Wi-Fi에서 양보합니다</span></div>
+</div>
+
+<p class="note">설치 중 관리자 비밀번호를 한 번 물어봅니다.
+네트워크 설정을 바꾸는 백그라운드 서비스를 등록하는 용도이며,
+설치 후에는 앱에서 비밀번호를 다시 묻지 않습니다.<br>
+제거는 메뉴바 아이콘 › “netauto 제거…” 에서 할 수 있습니다.</p>
+
+<p class="credit">netauto {{VERSION}} &nbsp;·&nbsp; by <strong>devpaulie</strong></p>

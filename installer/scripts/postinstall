@@ -1,0 +1,41 @@
+#!/bin/bash
+# 설치 마무리: 디렉터리 권한, 기본 설정 배치, 데몬·앱 서비스 등록
+set -u
+
+DAEMON=dev.devpaulie.netauto
+AGENT=dev.devpaulie.netauto.bar
+CONF_DIR=/usr/local/etc/netauto
+CONF=$CONF_DIR/config.json
+STATE=/usr/local/var/netauto
+LOG=/var/log/netauto.log
+
+# 실행 파일은 root 전용, 앱이 써야 하는 디렉터리는 admin 그룹 쓰기 허용
+/usr/bin/install -d -o root -g wheel -m 755 /usr/local/libexec /usr/local/etc /usr/local/var
+/usr/bin/install -d -o root -g admin -m 775 "$CONF_DIR" "$STATE" "$STATE/queue"
+/bin/rm -f "$STATE/queue"/* 2>/dev/null || true
+
+# 설정은 처음 설치할 때만 복사한다 (다시 설치해도 내 규칙이 유지되도록)
+if [ ! -f "$CONF" ]; then
+  /usr/bin/install -o root -g admin -m 664 \
+    /usr/local/share/netauto/config.default.json "$CONF"
+else
+  /usr/sbin/chown root:admin "$CONF" 2>/dev/null || true
+  /bin/chmod 664 "$CONF" 2>/dev/null || true
+fi
+
+[ -e "$LOG" ] || { : > "$LOG"; /usr/sbin/chown root:wheel "$LOG"; /bin/chmod 644 "$LOG"; }
+
+# 백그라운드 데몬 (실제 전환 담당 · 로그인 화면에서도 동작)
+/bin/launchctl bootout "system/$DAEMON" 2>/dev/null || true
+/bin/launchctl bootstrap system "/Library/LaunchDaemons/$DAEMON.plist"
+/bin/launchctl enable "system/$DAEMON"
+
+# 메뉴바 앱 (지금 로그인한 사용자 세션에 등록 + 즉시 실행)
+uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null || echo "")
+if [ -n "$uid" ] && [ "$uid" != "0" ]; then
+  /bin/launchctl bootout "gui/$uid/$AGENT" 2>/dev/null || true
+  /bin/launchctl bootstrap "gui/$uid" "/Library/LaunchAgents/$AGENT.plist"
+  /bin/launchctl enable "gui/$uid/$AGENT"
+fi
+
+exit 0

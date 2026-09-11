@@ -1,0 +1,21 @@
+{
+  "version" : 2,
+
+  "options" : {
+    "notify" : true,
+    "respect_manual" : true,
+    "no_wifi" : "skip",
+    "menubar_text" : true
+  },
+
+  "profiles" : [
+    { "location" : "Automatic", "label" : "Auto", "icon" : "globe" }
+  ],
+
+  "rules" : [
+    { "ssid" : "*", "location" : "Automatic", "ip_mode" : "keep", "ip" : "" }
+  ],
+
+  "saved_ips" : [
+  ]
+}

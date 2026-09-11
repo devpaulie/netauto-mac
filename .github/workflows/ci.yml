@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test & build
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Shell syntax check
+        run: |
+          for f in bin/netauto bin/netauto-uninstall setup.sh install.sh uninstall.sh \
+                   install-app.sh uninstall-app.sh build-app.sh build-installer.sh \
+                   installer/scripts/preinstall installer/scripts/postinstall \
+                   tests/*.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+      - name: Validate plists and default config
+        run: |
+          plutil -lint launchd/*.plist installer/*.plist
+          plutil -convert xml1 -o /dev/null etc/netauto.json
+
+      # 네트워크 명령은 전부 모의 구현으로 대체되므로
+      # 러너의 실제 네트워크 설정은 건드리지 않는다.
+      - name: Daemon logic tests
+        run: ./tests/test_netauto.sh
+
+      - name: Config round-trip tests (Swift ↔ bash)
+        run: ./tests/test_config_roundtrip.sh
+
+      - name: Build universal app
+        run: ./build-app.sh
+
+      - name: Verify universal binary
+        run: |
+          lipo -info dist/NetautoBar.app/Contents/MacOS/NetautoBar
+          lipo -info dist/NetautoBar.app/Contents/MacOS/NetautoBar | grep -q x86_64
+          lipo -info dist/NetautoBar.app/Contents/MacOS/NetautoBar | grep -q arm64
+
+      - name: Build installer (pkg + dmg)
+        run: ./build-installer.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: netauto-installer
+          path: |
+            dist/*.pkg
+            dist/*.dmg
+          retention-days: 14

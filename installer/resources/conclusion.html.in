@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, "Apple SD Gothic Neo", sans-serif; color: #1d1d1f;
+         margin: 0; line-height: 1.65; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  h3 { font-size: 13px; margin: 16px 0 6px; }
+  p { margin: 0 0 12px; }
+  .box { background: #f5f5f7; border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; }
+  code { background: #ececf0; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  .note { color: #6e6e73; font-size: 12px; }
+  .legend { margin: 6px 0; }
+  .legend .item { display: flex; align-items: center; gap: 7px; margin: 5px 0; }
+  .legend .nm { font-weight: 600; min-width: 46px; }
+  .states { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 0;
+            color: #6e6e73; font-size: 12px; }
+  .states span { display: inline-flex; align-items: center; gap: 5px; }
+  ol { margin: 0 0 12px; padding-left: 18px; }
+  li { margin: 3px 0; }
+  .credit { color: #86868b; font-size: 11px; margin: 16px 0 0;
+            border-top: 1px solid #e5e5ea; padding-top: 10px; }
+  {{ICON_CSS}}
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f7; }
+    .box { background: #2c2c2e; }
+    code { background: #3a3a3c; }
+    .note, .states { color: #98989d; }
+    .credit { color: #8e8e93; border-top-color: #3a3a3c; }
+  }
+</style>
+<h2>설치가 끝났습니다</h2>
+<p>화면 오른쪽 위 <b>메뉴바</b>를 보세요. 아이콘과 함께 지금 적용된 설정 이름이 보입니다.</p>
+
+<div class="box">
+  <div class="legend">
+    <div class="item">{{ICON:office}}<span class="nm">Office</span><span>사내 설정 적용 중 (고정 IP·프록시)</span></div>
+    <div class="item">{{ICON:auto}}<span class="nm">Auto</span><span>일반 설정 (DHCP)</span></div>
+  </div>
+  <div class="states">
+    <span>{{ICON:manual}} 내가 직접 고른 상태</span>
+    <span>{{ICON:paused}} 잠시 멈춤</span>
+    <span>{{ICON:off}} 자동 전환 꺼짐</span>
+  </div>
+</div>
+
+<p>아이콘을 누르면 지금 상태를 확인하고, 프로필과 IP를 바꾸고, 아이콘·이름까지 고칠 수 있습니다.</p>
+
+<h3>처음이라면 이 순서로</h3>
+<ol>
+  <li><b>시스템 설정 › 네트워크</b> › 오른쪽 위 <code>⋯</code> › <b>위치</b> › <b>위치 편집…</b> 에서
+      쓸 위치를 만듭니다 (예: <i>사무실</i>).</li>
+  <li>그 위치로 전환해 사무실 IP·프록시를 설정한 뒤 <code>Automatic</code> 으로 돌아옵니다.</li>
+  <li>메뉴바 › <b>설정…</b> 에서 규칙을 추가합니다 —
+      <i>Wi-Fi 이름 = OfficeWiFi, 프로필 = 사무실, IP = 고정</i></li>
+</ol>
+
+<p class="note">지금 설정은 “그 외 모든 Wi-Fi → Automatic → IP 그대로” 이므로,
+규칙을 추가하기 전에는 아무것도 바꾸지 않습니다.<br>
+제거하려면 메뉴바 아이콘 › <b>netauto 제거…</b></p>
+
+<p class="credit">netauto {{VERSION}} &nbsp;·&nbsp; by <strong>devpaulie</strong></p>

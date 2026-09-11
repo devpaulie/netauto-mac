@@ -1,0 +1,53 @@
+#!/bin/bash
+# netauto 완전 제거 — 메뉴바 앱의 "netauto 제거…" 가 관리자 권한으로 실행한다.
+# 네트워크 위치(프로필) 자체는 건드리지 않는다.
+set -u
+
+DAEMON=dev.devpaulie.netauto
+AGENT=dev.devpaulie.netauto.bar
+BIN=/usr/local/libexec/netauto
+APP=/Applications/NetautoBar.app
+KEEP_CONF="${KEEP_CONF:-0}"
+
+[ "$(id -u)" = "0" ] || { echo "관리자 권한이 필요합니다" >&2; exit 1; }
+
+# 메뉴바 앱 내리기
+uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null || echo "")
+if [ -n "$uid" ] && [ "$uid" != "0" ]; then
+  /bin/launchctl bootout "gui/$uid/$AGENT" 2>/dev/null || true
+fi
+/usr/bin/pkill -x NetautoBar 2>/dev/null || true
+
+# 데몬 내리기
+/bin/launchctl bootout "system/$DAEMON" 2>/dev/null || true
+
+# 예전 버전이 다른 식별자로 남겨둔 서비스도 찾아서 지운다
+# (식별자를 하드코딩하지 않고 우리 실행 파일을 가리키는 plist 를 찾는다)
+cleanup_stale() { # $1=plist 디렉터리  $2=launchd 도메인
+  local dir="$1" domain="$2" plist label
+  [ -d "$dir" ] || return 0
+  for plist in "$dir"/*.plist; do
+    [ -f "$plist" ] || continue
+    label=$(/usr/bin/basename "$plist" .plist)
+    /usr/bin/plutil -convert xml1 -o - "$plist" 2>/dev/null \
+      | /usr/bin/grep -q -e "$BIN" -e "$APP" || continue
+    /bin/launchctl bootout "$domain/$label" 2>/dev/null || true
+    /bin/rm -f "$plist"
+  done
+}
+cleanup_stale /Library/LaunchDaemons system
+[ -n "$uid" ] && [ "$uid" != "0" ] && cleanup_stale /Library/LaunchAgents "gui/$uid"
+
+# 파일 제거
+/bin/rm -f "/Library/LaunchDaemons/$DAEMON.plist" "/Library/LaunchAgents/$AGENT.plist"
+/bin/rm -rf /Applications/NetautoBar.app
+/bin/rm -f /usr/local/libexec/netauto /usr/local/libexec/netauto-uninstall /usr/local/bin/netauto
+/bin/rm -rf /usr/local/share/netauto /usr/local/var/netauto
+[ "$KEEP_CONF" = "1" ] || /bin/rm -rf /usr/local/etc/netauto
+/bin/rm -f /var/log/netauto.log
+
+# 설치 기록 삭제 (다시 설치할 때 깔끔하게)
+/usr/sbin/pkgutil --forget "$DAEMON" >/dev/null 2>&1 || true
+
+echo "netauto 를 제거했습니다. 네트워크 프로필(Office / Automatic 등)은 그대로 남아 있습니다."
+exit 0
