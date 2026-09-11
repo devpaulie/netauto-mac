@@ -186,6 +186,7 @@ netauto status              # current Wi-Fi, profile, IP, rules, saved IPs
 netauto status --json       # machine-readable (what the app reads)
 netauto test <ssid>         # what would happen on that Wi-Fi (changes nothing)
 netauto log [lines]
+netauto doctor              # diagnose why switching isn't happening
 
 netauto pick <profile>      # switch profile, mark as a manual override
 netauto setip <address>     # pin a static address
@@ -198,6 +199,33 @@ sudo netauto off | on
 
 Admin users can run `pick`, `setip` and `setdhcp` without `sudo` — the request
 goes through the daemon queue.
+
+---
+
+## Troubleshooting
+
+Run **`netauto doctor`** first. It prints the macOS version, the Wi-Fi device,
+**each SSID detection method and whether it worked**, network Locations, config
+validity, the rule verdict, service registration and the recent log — everything
+needed to tell what's wrong. Paste that output into an [issue](../../issues).
+
+### Nothing switches on macOS 15 (Sequoia) or later
+
+Since macOS 15, **reading the Wi-Fi name requires Location Services**. Without the
+name there's no rule to match, so the icon appears but nothing ever changes.
+
+If every entry under `[SSID 감지]` in `netauto doctor` is `✗`, that's this. netauto
+tries five paths in order:
+
+| Method | Note |
+|---|---|
+| `networksetup -getairportnetwork` | fastest; may be gated on macOS 15+ |
+| `ipconfig getsummary` | SSID field |
+| `scutil` `SSID_STR` | already redacted on some 14.x systems |
+| `scutil` `ProfileID` hex decode | the name survives here as hex |
+| `wdutil info` | real value only as root (the daemon is root) |
+
+The panel also shows a warning with an **Open Location Services settings** button.
 
 ---
 

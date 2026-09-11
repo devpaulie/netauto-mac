@@ -142,6 +142,10 @@ struct PanelView: View {
                 notInstalled
             } else {
                 header
+                if model.cannotReadSSID {
+                    separator
+                    ssidWarning
+                }
                 separator
                 infoGrid
                 separator
@@ -157,6 +161,27 @@ struct PanelView: View {
         .frame(width: UX.panelWidth)
         .background(UX.background)      // 반투명 배경의 대비 문제를 없앤다
         .onAppear { model.refresh() }
+    }
+
+    // macOS 15 부터 Wi-Fi 이름 읽기에 위치 서비스 권한이 필요하다.
+    // 이름을 못 읽으면 규칙을 적용할 수 없으므로, 무엇을 해야 하는지 알려준다.
+    private var ssidWarning: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12)).foregroundStyle(.orange)
+                Text("Wi-Fi 이름을 읽을 수 없습니다")
+                    .font(.system(size: UX.rowSize, weight: .semibold))
+            }
+            Text("macOS 15 부터 Wi-Fi 이름을 읽으려면 위치 서비스가 켜져 있어야 합니다. 이름을 모르면 규칙을 적용할 수 없습니다.")
+                .font(.system(size: UX.capSize))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("위치 서비스 설정 열기") { model.openLocationSettings() }
+                .buttonStyle(.link)
+                .font(.system(size: UX.capSize))
+        }
+        .padding(.horizontal, UX.hPad)
     }
 
     private var separator: some View {

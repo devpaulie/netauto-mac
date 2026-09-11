@@ -51,6 +51,33 @@ case "$1" in
   *) exit 1 ;;
 esac
 MOCK
+cat > "$TMP/mock/scutil" <<'MOCK'
+#!/bin/bash
+# scutil 모의 — stdin 으로 "show State:/..." 를 받는다.
+# MOCK_SCUTIL_SSID   : SSID_STR 로 내보낼 값 (빈 값이면 가려진 상태를 흉내)
+# MOCK_SCUTIL_HEX    : ProfileID 에 실을 hex (빈 값이면 ProfileID 자체를 내지 않음)
+IFS= read -r cmd
+case "$cmd" in
+  *AirPort*)
+    printf '  BSSID : <data> 0x020000000000\n'
+    printf '  SSID : <data> 0x00\n'
+    printf '  SSID_STR : %s\n' "${MOCK_SCUTIL_SSID:-}"
+    [ -n "${MOCK_SCUTIL_HEX:-}" ] && printf '  ProfileID : wifi.ssid.%s\n' "$MOCK_SCUTIL_HEX"
+    ;;
+esac
+exit 0
+MOCK
+cat > "$TMP/mock/wdutil" <<'MOCK'
+#!/bin/bash
+# wdutil 모의 — MOCK_WDUTIL_SSID 가 있으면 그 값을, 없으면 가려진 값을 낸다
+[ "$1" = "info" ] || exit 1
+if [ -n "${MOCK_WDUTIL_SSID:-}" ]; then
+  printf '    SSID : %s\n' "$MOCK_WDUTIL_SSID"
+else
+  printf '    SSID : <redacted>\n'
+fi
+exit 0
+MOCK
 cat > "$TMP/mock/id_root" <<'MOCK'
 #!/bin/bash
 echo 0
@@ -93,6 +120,9 @@ run() { # 나머지 인자는 netauto 서브커맨드
   NETAUTO_NETWORKSETUP="$TMP/mock/networksetup" \
   NETAUTO_IPCONFIG="$TMP/mock/ipconfig" \
   NETAUTO_ID="$idmock" \
+  NETAUTO_SCUTIL="$TMP/mock/scutil" NETAUTO_WDUTIL="$TMP/mock/wdutil" \
+  MOCK_SCUTIL_SSID="${MOCK_SCUTIL_SSID:-}" MOCK_SCUTIL_HEX="${MOCK_SCUTIL_HEX:-}" \
+  MOCK_WDUTIL_SSID="${MOCK_WDUTIL_SSID:-}" \
   MOCK_SSID="${MOCK_SSID:-}" MOCK_LOCATION="${MOCK_LOCATION:-Automatic}" \
   MOCK_POWER="${MOCK_POWER:-On}" MOCK_SWITCH_LOG="$TMP/switched" MOCK_IP_LOG="$TMP/ipset" \
   MOCK_CURRENT_IP="${MOCK_CURRENT_IP:-10.0.0.9}" MOCK_IPV4_MODE="${MOCK_IPV4_MODE:-dhcp}" \
@@ -197,14 +227,41 @@ out=$(AS_ROOT=1 MOCK_SSID=OfficeWiFi MOCK_LOCATION=Automatic run apply)
 check "on 후 정상 적용" "Office" "$(switched)"
 
 echo
-echo "── 8. Wi-Fi 미연결 / 전원 꺼짐 ───────────────────────────────"
+echo "── 8. Wi-Fi 전원 꺼짐 / 이름을 못 읽는 경우 ──────────────────"
 reset
-out=$(AS_ROOT=1 MOCK_SSID="" MOCK_LOCATION=Office run apply)
-has   "미연결 시 no_wifi=skip 존중" "Wi-Fi 미연결" "$(logtail)"
-check "미연결 시 전환 없음" "" "$(switched)"
+out=$(AS_ROOT=1 MOCK_POWER=Off MOCK_SSID="" MOCK_LOCATION=Office run apply)
+has   "전원 꺼짐은 미연결로 기록" "Wi-Fi 미연결" "$(logtail)"
+check "전원 꺼짐이면 전환 없음" "" "$(switched)"
 reset
 out=$(AS_ROOT=1 MOCK_POWER=Off MOCK_SSID=OfficeWiFi MOCK_LOCATION=Automatic run apply)
-check "Wi-Fi 전원 꺼짐이면 전환 없음" "" "$(switched)"
+check "전원 꺼짐이면 SSID 가 있어도 전환 없음" "" "$(switched)"
+reset
+# Wi-Fi 는 켜져 있는데 모든 방법이 이름을 못 읽는 상황 (macOS 15+ 위치 권한)
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_LOCATION=Office run apply)
+has   "켜져 있지만 이름을 못 읽으면 그렇게 기록" "이름을 읽을 수 없음" "$(logtail)"
+check "이름을 못 읽으면 전환하지 않음" "" "$(switched)"
+
+echo
+echo "── 8b. SSID 감지 대체 경로 ───────────────────────────────────"
+reset
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_SCUTIL_SSID=OfficeWiFi \
+      MOCK_LOCATION=Automatic run apply)
+check "scutil SSID_STR 로 감지 → 전환" "Office" "$(switched)"
+reset
+# SSID_STR 까지 가려져도 ProfileID hex 로 복호한다
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_SCUTIL_SSID="" \
+      MOCK_SCUTIL_HEX="$(printf 'OfficeWiFi' | xxd -p)" MOCK_LOCATION=Automatic run apply)
+check "ProfileID hex 복호로 감지 → 전환" "Office" "$(switched)"
+reset
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_WDUTIL_SSID=OfficeWiFi \
+      MOCK_LOCATION=Automatic run apply)
+check "wdutil 로 감지 → 전환" "Office" "$(switched)"
+reset
+# 가려진 값(<redacted>)은 SSID 로 받아들이지 않는다
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_SCUTIL_SSID="<redacted>" \
+      MOCK_LOCATION=Automatic run apply)
+has   "가려진 값은 거부" "이름을 읽을 수 없음" "$(logtail)"
+check "가려진 값으로 전환하지 않음" "" "$(switched)"
 
 echo
 echo "── 9. 없는 위치를 가리키는 규칙 ──────────────────────────────"
@@ -302,7 +359,11 @@ json=$(MOCK_SSID=OfficeWiFi MOCK_LOCATION=Office run status --json); check "stat
 reset; run pause 30 >/dev/null
 json=$(MOCK_SSID=OfficeWiFi MOCK_LOCATION=Office run status --json); check "state=paused"   "paused"   "$(jget state)"
 reset
-json=$(MOCK_SSID="" MOCK_LOCATION=Office run status --json);      check "state=nowifi"   "nowifi"   "$(jget state)"
+json=$(MOCK_POWER=Off MOCK_SSID="" MOCK_LOCATION=Office run status --json)
+check "state=nowifi (전원 꺼짐)" "nowifi" "$(jget state)"
+reset
+json=$(MOCK_POWER=On MOCK_SSID="" MOCK_LOCATION=Office run status --json)
+check "state=nossid (켜졌지만 이름 못 읽음)" "nossid" "$(jget state)"
 reset
 AS_ROOT=1 MOCK_SSID=OfficeWiFi MOCK_LOCATION=Automatic run apply >/dev/null
 AS_ROOT=1 MOCK_SSID=OfficeWiFi MOCK_LOCATION=Automatic run apply >/dev/null

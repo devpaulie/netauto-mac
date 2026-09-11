@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 
 CONF="${NETAUTO_CONF:-/usr/local/etc/netauto/config.json}"
 PLUTIL=/usr/bin/plutil
@@ -25,6 +25,9 @@ LOG="${NETAUTO_LOG:-/var/log/netauto.log}"
 NETWORKSETUP="${NETAUTO_NETWORKSETUP:-/usr/sbin/networksetup}"
 IPCONFIG="${NETAUTO_IPCONFIG:-/usr/sbin/ipconfig}"
 ID="${NETAUTO_ID:-/usr/bin/id}"
+SCUTIL="${NETAUTO_SCUTIL:-/usr/sbin/scutil}"
+WDUTIL="${NETAUTO_WDUTIL:-/usr/bin/wdutil}"
+XXD="${NETAUTO_XXD:-/usr/bin/xxd}"
 
 # 옵션 기본값 (설정 파일의 options 로 덮어씀)
 OPT_NOTIFY="on"          # 전환 시 macOS 알림
@@ -213,18 +216,93 @@ wifi_power_on() { # $1=dev
   case "$out" in *": On"*) return 0 ;; *) return 1 ;; esac
 }
 
-# SSID 감지. networksetup 우선, 실패 시 ipconfig로 폴백. (airport -I는 14.4에서 폐기)
+# ── SSID 감지 ────────────────────────────────────────────────────────
+# macOS 15 부터 Wi-Fi 이름 읽기에 위치 서비스 권한이 걸렸고, root 데몬은
+# 그 권한을 받을 수 없다. 그래서 한 방법에 의존하지 않고 여러 경로를 시도한다.
+# (airport -I 은 14.4 에서 폐기돼 쓰지 않는다)
+
+# 읽어온 값이 쓸 만한 SSID 인가 — 빈 값·가려진 값·안내 문구를 걸러낸다
+sanitize_ssid() { # $1=후보
+  local v="$1"
+  v=$(printf '%s' "$v" | /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$v" ] || return 1
+  case "$v" in
+    *redacted*|*REDACTED*|'<redacted>') return 1 ;;
+    *"not associated"*|*"You are not"*)  return 1 ;;
+    '0x0'|'<data>'*)                     return 1 ;;
+  esac
+  printf '%s' "$v"
+}
+
+ssid_via_networksetup() { # $1=dev
+  "$NETWORKSETUP" -getairportnetwork "$1" 2>/dev/null \
+    | /usr/bin/sed -n 's/^Current Wi-Fi Network: //p' | /usr/bin/head -1
+}
+
+ssid_via_ipconfig() { # $1=dev
+  "$IPCONFIG" getsummary "$1" 2>/dev/null \
+    | /usr/bin/awk -F' SSID : ' '/ SSID : /{print $2; exit}'
+}
+
+ssid_via_scutil_str() { # $1=dev
+  printf 'show State:/Network/Interface/%s/AirPort\n' "$1" | "$SCUTIL" 2>/dev/null \
+    | /usr/bin/sed -n 's/^[[:space:]]*SSID_STR[[:space:]]*:[[:space:]]*//p' | /usr/bin/head -1
+}
+
+# SSID_STR 이 가려져도 ProfileID 에 hex 로 남아 있는 경우가 있다
+#   ProfileID : wifi.ssid.5061756c696550686f6e65  →  "PauliePhone"
+ssid_via_scutil_profile() { # $1=dev
+  local hex
+  hex=$(printf 'show State:/Network/Interface/%s/AirPort\n' "$1" | "$SCUTIL" 2>/dev/null \
+        | /usr/bin/sed -n 's/.*ProfileID[[:space:]]*:[[:space:]]*wifi\.ssid\.\([0-9a-fA-F]*\).*/\1/p' \
+        | /usr/bin/head -1)
+  [ -n "$hex" ] || return 0
+  printf '%s' "$hex" | "$XXD" -r -p 2>/dev/null
+}
+
+# wdutil 은 root 로 실행할 때만 실제 값을 보여준다. 데몬은 root 로 돌므로 쓸 수 있다.
+# 다만 느려서 마지막 수단으로만 쓴다.
+ssid_via_wdutil() {
+  [ -x "$WDUTIL" ] || return 0
+  "$WDUTIL" info 2>/dev/null \
+    | /usr/bin/awk -F':' '/^[[:space:]]*SSID[[:space:]]*:/ {
+        sub(/^[^:]*:[[:space:]]*/, "", $0); print $0; exit }' \
+    | /usr/bin/head -1
+}
+
+# "방법<SEP>SSID" 를 출력한다. 명령 치환($(...)) 은 서브셸이라 변수로는
+# 호출자에게 전달되지 않으므로 값에 실어 보낸다.
+detect_ssid_once() { # $1=dev
+  local dev="$1" v out
+  for m in networksetup ipconfig scutil_str scutil_profile wdutil; do
+    case "$m" in
+      networksetup)   v=$(ssid_via_networksetup "$dev") ;;
+      ipconfig)       v=$(ssid_via_ipconfig "$dev") ;;
+      scutil_str)     v=$(ssid_via_scutil_str "$dev") ;;
+      scutil_profile) v=$(ssid_via_scutil_profile "$dev") ;;
+      wdutil)         [ "$("$ID" -u)" = "0" ] || continue
+                      v=$(ssid_via_wdutil) ;;
+    esac
+    if out=$(sanitize_ssid "$v"); then
+      printf '%s%s%s' "$m" "$SEP" "$out"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 마지막 감지에 성공한 방법 (doctor 와 로그에서 쓴다)
+SSID_METHOD=""
 current_ssid() { # $1=dev
-  local dev="$1" s="" i=0 tries="$OPT_SSID_RETRY"
+  local dev="$1" i=0 tries="$OPT_SSID_RETRY" r
+  SSID_METHOD=""
   wifi_power_on "$dev" || return 1
   while :; do
-    s=$("$NETWORKSETUP" -getairportnetwork "$dev" 2>/dev/null \
-        | /usr/bin/sed -n 's/^Current Wi-Fi Network: //p')
-    if [ -z "$s" ]; then
-      s=$("$IPCONFIG" getsummary "$dev" 2>/dev/null \
-          | /usr/bin/awk -F' SSID : ' '/ SSID : /{print $2; exit}')
+    if r=$(detect_ssid_once "$dev"); then
+      SSID_METHOD="${r%%${SEP}*}"
+      printf '%s' "${r#*${SEP}}"
+      return 0
     fi
-    [ -n "$s" ] && { printf '%s' "$s"; return 0; }
     i=$((i + 1)); [ "$i" -ge "$tries" ] && return 1
     /bin/sleep 1
   done
@@ -425,7 +503,12 @@ cmd_apply() { # $1=force(1이면 우선순위·수동존중 무시)
 
   if ! ssid=$(current_ssid "$dev"); then
     if [ "$OPT_NO_WIFI" = "skip" ]; then
-      log "건너뜀: Wi-Fi 미연결 (no_wifi=skip)"; return 0
+      if wifi_power_on "$dev"; then
+        log "건너뜀: Wi-Fi 는 켜져 있지만 이름을 읽을 수 없음 (no_wifi=skip · netauto doctor 로 확인)"
+      else
+        log "건너뜀: Wi-Fi 미연결 (no_wifi=skip)"
+      fi
+      return 0
     fi
     ssid=""
   fi
@@ -573,7 +656,10 @@ cmd_status_json() {
 
   if is_disabled;                                        then state="disabled"
   elif [ "$rem" -gt 0 ] 2>/dev/null;                     then state="paused"
-  elif [ "$connected" = "false" ];                       then state="nowifi"
+  elif [ "$connected" = "false" ]; then
+    # Wi-Fi 는 켜져 있는데 이름만 못 읽는 경우와 진짜 미연결을 구분한다.
+    # macOS 15+ 는 SSID 읽기에 위치 서비스 권한을 요구하므로 전자가 생길 수 있다.
+    if wifi_power_on "$dev"; then state="nossid"; else state="nowifi"; fi
   elif [ -n "$ssid" ] && [ "$ST_OVERRIDE_SSID" = "$ssid" ]; then state="manual"
   else                                                        state="auto"; fi
 
@@ -730,6 +816,135 @@ cmd_ssids() {
     | /usr/bin/sed -n 's/^\t//p' | /usr/bin/awk -v c="$cur" '$0 != c && NF'
 }
 
+# ── 진단 ─────────────────────────────────────────────────────────────
+# "아이콘은 뜨는데 전환이 안 된다" 같은 상황의 원인을 한 번에 보여준다.
+# 이 출력을 그대로 복사해 보내면 원격에서 판단할 수 있다.
+cmd_doctor() {
+  local dev svc cur ssid v ok i loc
+  load_options; load_rules; state_load
+
+  printf 'netauto %s — 진단\n' "$VERSION"
+  printf '════════════════════════════════════════════════════════\n\n'
+
+  printf '[시스템]\n'
+  printf '  macOS        : %s (%s)\n' \
+    "$(/usr/bin/sw_vers -productVersion 2>/dev/null)" \
+    "$(/usr/bin/sw_vers -buildVersion 2>/dev/null)"
+  printf '  하드웨어     : %s\n' "$(/usr/bin/uname -m)"
+  printf '  실행 권한    : uid %s%s\n' "$("$ID" -u)" \
+    "$([ "$("$ID" -u)" = "0" ] && printf ' (root)' || printf ' (일반 사용자)')"
+  printf '\n'
+
+  printf '[Wi-Fi 인터페이스]\n'
+  dev=$(wifi_device)
+  printf '  장치         : %s\n' "${dev:-검출 실패}"
+  if [ -n "$dev" ]; then
+    printf '  전원         : %s\n' "$("$NETWORKSETUP" -getairportpower "$dev" 2>&1 | /usr/bin/sed 's/.*: //')"
+    svc=$(service_for_device "$dev")
+    printf '  서비스 이름  : %s\n' "${svc:-검출 실패}"
+    printf '  활성 IP      : %s\n' "$(current_ip "$dev")"
+  fi
+  printf '\n'
+
+  # ── 여기가 핵심. macOS 15+ 는 SSID 읽기에 위치 권한을 요구한다 ──
+  printf '[SSID 감지 — 방법별 결과]\n'
+  if [ -z "$dev" ]; then
+    printf '  (Wi-Fi 장치를 찾지 못해 확인할 수 없습니다)\n'
+  else
+    for m in networksetup ipconfig scutil_str scutil_profile wdutil; do
+      case "$m" in
+        networksetup)   v=$(ssid_via_networksetup "$dev") ;;
+        ipconfig)       v=$(ssid_via_ipconfig "$dev") ;;
+        scutil_str)     v=$(ssid_via_scutil_str "$dev") ;;
+        scutil_profile) v=$(ssid_via_scutil_profile "$dev") ;;
+        wdutil)         if [ "$("$ID" -u)" != "0" ]; then
+                          printf '  %-16s : (root 로 실행해야 확인 가능)\n' "$m"; continue
+                        fi
+                        v=$(ssid_via_wdutil) ;;
+      esac
+      if ok=$(sanitize_ssid "$v"); then
+        printf '  %-16s : ✓ %s\n' "$m" "$ok"
+      else
+        printf '  %-16s : ✗ %s\n' "$m" "$(printf '%s' "${v:-(빈 값)}" | /usr/bin/tr -d '\n' | /usr/bin/cut -c1-40)"
+      fi
+    done
+    printf '\n'
+    if v=$(detect_ssid_once "$dev"); then
+      printf '  → 사용된 방법 : %s\n' "${v%%${SEP}*}"
+      ssid="${v#*${SEP}}"
+      printf '  → 감지된 SSID : %s\n' "$ssid"
+    else
+      printf '  → 모든 방법 실패. Wi-Fi 이름을 읽을 수 없습니다.\n'
+      printf '     macOS 15 부터 SSID 읽기에 위치 서비스 권한이 필요합니다.\n'
+      printf '     시스템 설정 › 개인 정보 보호 및 보안 › 위치 서비스 를 확인하세요.\n'
+      ssid=""
+    fi
+  fi
+  printf '\n'
+
+  printf '[네트워크 위치]\n'
+  cur=$(current_location)
+  printf '  현재         : %s\n' "${cur:-읽기 실패}"
+  printf '  사용 가능    : '
+  loc=$("$NETWORKSETUP" -listlocations 2>/dev/null | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+  printf '%s\n' "${loc:-없음}"
+  printf '\n'
+
+  printf '[설정]\n'
+  printf '  파일         : %s\n' "$CONF"
+  printf '  존재/읽기    : %s\n' "$([ -r "$CONF" ] && echo 예 || echo '아니오 ✗')"
+  printf '  JSON 유효성  : %s\n' "$(cfg_valid && echo 정상 || echo '깨짐 ✗')"
+  printf '  규칙 수      : %s\n' "$(printf '%s' "$RULES_TSV" | /usr/bin/grep -c . 2>/dev/null || echo 0)"
+  if [ -n "$RULES_TSV" ]; then
+    printf '%s' "$RULES_TSV" | /usr/bin/awk -F"$SEP" '
+      NF >= 3 { m = ($3 == "dhcp" ? "IP 자동" : ($3 == "manual" ? "IP 고정 " $4 : "IP 그대로"))
+                printf "                 %s → %s, %s\n", $1, $2, m }'
+  fi
+  printf '\n'
+
+  printf '[판정]\n'
+  if [ -n "$ssid" ] && [ -n "$cur" ]; then
+    split_rule "$(rule_lookup "$ssid")"
+    if [ -z "$RL_LOC" ]; then
+      printf "  ⚠ '%s' 에 맞는 규칙이 없습니다. 설정에서 규칙을 추가하세요.\n" "$ssid"
+    else
+      printf '  규칙상 기대  : %s, %s\n' "$RL_LOC" "$(ip_mode_desc "$RL_MODE" "$RL_IP")"
+      [ "$cur" = "$RL_LOC" ] && printf '  프로필       : 일치 ✓\n' \
+                             || printf '  프로필       : 불일치 ✗ (현재 %s)\n' "$cur"
+      location_exists "$RL_LOC" && printf '  위치 존재    : 예 ✓\n' \
+                                || printf "  위치 존재    : 아니오 ✗ ('%s' 가 시스템에 없습니다)\n" "$RL_LOC"
+    fi
+  elif [ -z "$ssid" ]; then
+    printf '  ⚠ SSID 를 읽지 못해 규칙을 적용할 수 없습니다 — 위 SSID 감지 항목을 보세요.\n'
+    printf '    no_wifi=%s 설정이라 이 상태에서는 %s.\n' "$OPT_NO_WIFI" \
+      "$([ "$OPT_NO_WIFI" = "skip" ] && printf '아무것도 하지 않습니다' || printf '기본 위치를 적용합니다')"
+  fi
+  if is_disabled;                then printf '  ⚠ 자동 전환이 꺼져 있습니다 (netauto on)\n'; fi
+  if [ -n "$(pause_remaining)" ]; then printf '  ⚠ 일시중지 상태입니다 (netauto resume)\n'; fi
+  if [ -n "$ssid" ] && [ "$ST_OVERRIDE_SSID" = "$ssid" ]; then
+    printf '  ⚠ 이 Wi-Fi 에서 수동 지정 상태입니다 (netauto apply --force)\n'
+  fi
+  printf '\n'
+
+  printf '[서비스]\n'
+  printf '  실행 파일    : %s\n' "$([ -x /usr/local/libexec/netauto ] && echo '있음 ✓' || echo '없음 ✗')"
+  printf '  요청 큐      : %s\n' "$(queue_available && echo '쓰기 가능 ✓' || echo '사용 불가 ✗')"
+  printf '  데몬 등록    : %s\n' \
+    "$([ -f /Library/LaunchDaemons/dev.devpaulie.netauto.plist ] && echo '있음 ✓' || echo '없음 ✗')"
+  printf '  앱 등록      : %s\n' \
+    "$([ -f /Library/LaunchAgents/dev.devpaulie.netauto.bar.plist ] && echo '있음 ✓' || echo '없음 ✗')"
+  printf '\n'
+
+  printf '[최근 로그 15줄]\n'
+  if [ -r "$LOG" ]; then
+    /usr/bin/tail -15 "$LOG" | /usr/bin/sed 's/^/  /'
+  else
+    printf '  (로그 없음: %s)\n' "$LOG"
+  fi
+  printf '\n════════════════════════════════════════════════════════\n'
+  printf '이 출력을 그대로 복사해 보내주세요.\n'
+}
+
 cmd_log() { [ -r "$LOG" ] && /usr/bin/tail -n "${1:-40}" "$LOG" || echo "로그 없음: $LOG"; }
 
 usage() {
@@ -749,6 +964,7 @@ netauto — SSID 기반 macOS 네트워크 위치 자동 전환
   netauto resume              일시중지 해제 (sudo)
   netauto off | on            완전 비활성 / 재활성 (sudo)
   netauto log [줄수]          로그 보기 (기본 40줄)
+  netauto doctor              진단 — 왜 전환이 안 되는지 한 번에 확인
 
 설정: /usr/local/etc/netauto/config.json  (메뉴바 앱의 "설정…" 에서 편집)
 USAGE
@@ -769,6 +985,7 @@ case "${1:-apply}" in
   on)     cmd_on ;;
   log)    shift || true; cmd_log "${1:-40}" ;;
   ssids)  cmd_ssids ;;
+  doctor) cmd_doctor ;;
   version|--version|-v) echo "netauto $VERSION" ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;

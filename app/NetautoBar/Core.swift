@@ -473,6 +473,7 @@ final class Model: ObservableObject {
         case "disabled": return "nosign"
         case "paused":   return "pause.circle"
         case "nowifi":   return "wifi.slash"
+        case "nossid":   return "wifi.exclamationmark"
         case "manual":   return "hand.raised.fill"
         default:
             return status.icon.isEmpty
@@ -489,6 +490,7 @@ final class Model: ObservableObject {
         case "disabled": return "꺼짐"
         case "paused":   return "일시중지"
         case "nowifi":   return "연결 없음"
+        case "nossid":   return "이름 확인 불가"
         default:         return status.label.isEmpty ? status.location : status.label
         }
     }
@@ -531,6 +533,7 @@ final class Model: ObservableObject {
         case "disabled": return .secondary
         case "paused":   return .secondary
         case "nowifi":   return .secondary
+        case "nossid":   return .orange
         case "manual":   return .orange
         default:         return .accentColor
         }
@@ -564,6 +567,18 @@ final class Model: ObservableObject {
         }
     }
 
+    /// SSID 를 읽지 못하는 상태인가 (macOS 15+ 위치 서비스 권한 문제)
+    var cannotReadSSID: Bool { status.state == "nossid" }
+
+    /// 위치 서비스 설정 창을 연다
+    func openLocationSettings() {
+        let urls = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices",
+        ]
+        for u in urls where NSWorkspace.shared.open(URL(string: u)!) { return }
+    }
+
     /// 현재 IP 가 저장 목록에 없는 주소인지 (있으면 목록에서 체크로 표시된다)
     var currentIPIsUnlisted: Bool {
         !isDHCP && !status.ipv4_address.isEmpty
@@ -578,6 +593,7 @@ final class Model: ObservableObject {
         case "disabled": return "자동 전환 꺼짐"
         case "paused":   return "일시중지 · \(status.pause_remaining / 60 + 1)분 남음"
         case "nowifi":   return "Wi-Fi 미연결"
+        case "nossid":   return "Wi-Fi 이름을 읽을 수 없음 — 위치 서비스 권한 필요"
         case "manual":   return "내가 고른 프로필 유지 중"
         default:
             return status.location == status.expected_location ? "자동 · 규칙과 일치" : "자동 · 적용 대기"
