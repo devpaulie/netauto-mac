@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.0"
+VERSION="2.7.0"
 
 CONF="${NETAUTO_CONF:-/usr/local/etc/netauto/config.json}"
 PLUTIL=/usr/bin/plutil
@@ -20,6 +20,8 @@ PAUSE_FLAG="$STATE_DIR/paused-until"
 DISABLE_FLAG="$STATE_DIR/disabled"
 LOCK_DIR="$STATE_DIR/lock"
 QUEUE_DIR="$STATE_DIR/queue"        # GUI → 데몬 요청 드롭박스 (launchd QueueDirectories)
+SSID_FILE="$STATE_DIR/ssid"          # 앱이 적어주는 Wi-Fi 이름 (macOS 15+ 우회)
+SSID_MAX_AGE="${NETAUTO_SSID_MAX_AGE:-90}"   # 이보다 오래된 값은 버린다(초)
 LOG="${NETAUTO_LOG:-/var/log/netauto.log}"
 
 NETWORKSETUP="${NETAUTO_NETWORKSETUP:-/usr/sbin/networksetup}"
@@ -234,6 +236,33 @@ sanitize_ssid() { # $1=후보
   printf '%s' "$v"
 }
 
+# macOS 15 부터 Wi-Fi 이름 읽기에 위치 서비스 권한이 걸렸고, root 데몬은 그 권한을
+# 받을 수 없다 (macOS 26 에서는 wdutil 조차 <redacted> 를 돌려준다).
+# 그래서 사용자 권한으로 도는 메뉴바 앱이 CoreWLAN 으로 읽어 이 파일에 적어 둔다.
+#   1행: 기록 시각(epoch), 2행: Wi-Fi 이름
+# 오래된 값은 버리므로 앱이 꺼져 있으면 자동으로 무효가 된다.
+ssid_via_appfile() {
+  [ -r "$SSID_FILE" ] || return 0
+  local ts name now age
+  ts=$(/usr/bin/sed -n '1p' "$SSID_FILE" 2>/dev/null)
+  name=$(/usr/bin/sed -n '2p' "$SSID_FILE" 2>/dev/null)
+  case "$ts" in ''|*[!0-9]*) return 0 ;; esac
+  now=$(/bin/date +%s)
+  age=$((now - ts))
+  [ "$age" -ge 0 ] && [ "$age" -le "$SSID_MAX_AGE" ] || return 0
+  printf '%s' "$name"
+}
+
+# 앱이 적어둔 값의 나이(초). 파일이 없으면 빈 값.
+appfile_age() {
+  [ -r "$SSID_FILE" ] || return 0
+  local ts now
+  ts=$(/usr/bin/sed -n '1p' "$SSID_FILE" 2>/dev/null)
+  case "$ts" in ''|*[!0-9]*) return 0 ;; esac
+  now=$(/bin/date +%s)
+  printf '%s' "$((now - ts))"
+}
+
 ssid_via_networksetup() { # $1=dev
   "$NETWORKSETUP" -getairportnetwork "$1" 2>/dev/null \
     | /usr/bin/sed -n 's/^Current Wi-Fi Network: //p' | /usr/bin/head -1
@@ -274,8 +303,9 @@ ssid_via_wdutil() {
 # 호출자에게 전달되지 않으므로 값에 실어 보낸다.
 detect_ssid_once() { # $1=dev
   local dev="$1" v out
-  for m in networksetup ipconfig scutil_str scutil_profile wdutil; do
+  for m in appfile networksetup ipconfig scutil_str scutil_profile wdutil; do
     case "$m" in
+      appfile)        v=$(ssid_via_appfile) ;;
       networksetup)   v=$(ssid_via_networksetup "$dev") ;;
       ipconfig)       v=$(ssid_via_ipconfig "$dev") ;;
       scutil_str)     v=$(ssid_via_scutil_str "$dev") ;;
@@ -816,6 +846,64 @@ cmd_ssids() {
     | /usr/bin/sed -n 's/^\t//p' | /usr/bin/awk -v c="$cur" '$0 != c && NF'
 }
 
+# ── 중복 앱 정리 ─────────────────────────────────────────────────────
+# 개발 중 빌드하거나 설치 프로그램이 엉뚱한 곳에 복사한 앱이 남으면
+# Launchpad 에 같은 이름이 여러 개 보인다. Launch Services 가 경로마다
+# 따로 등록하기 때문이다. 정품 경로 하나만 남기고 나머지를 지운다.
+APP_CANONICAL=/Applications/NetautoBar.app
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+
+# Launch Services 에 등록된 NetautoBar 경로를 모두 나열한다
+registered_apps() {
+  [ -x "$LSREGISTER" ] || return 0
+  "$LSREGISTER" -dump 2>/dev/null \
+    | /usr/bin/grep -oE '/[^[:space:]]*NetautoBar\.app' \
+    | /usr/bin/sort -u
+}
+
+cmd_cleanup() {
+  local p removed=0 kept=0
+  [ "$("$ID" -u)" = "0" ] || die "정리에는 root 권한이 필요합니다 (sudo 로 실행)"
+
+  printf '흩어진 NetautoBar 복사본 정리\n\n'
+
+  # 등록된 경로 + 실제 디스크 검색을 합친다
+  { registered_apps
+    /usr/bin/find /Applications "$HOME" -maxdepth 6 -name 'NetautoBar.app' -type d 2>/dev/null
+  } | /usr/bin/sort -u | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ "$p" = "$APP_CANONICAL" ]; then
+      printf '  유지  %s\n' "$p"
+      continue
+    fi
+    # Launch Services 등록 해제 후 삭제
+    [ -x "$LSREGISTER" ] && "$LSREGISTER" -u "$p" >/dev/null 2>&1
+    if [ -e "$p" ]; then
+      /bin/rm -rf "$p" 2>/dev/null && printf '  삭제  %s\n' "$p" \
+        || printf '  실패  %s (수동 삭제 필요)\n' "$p"
+    else
+      printf '  등록만 해제  %s\n' "$p"
+    fi
+  done
+
+  # 빈 채로 남은 래퍼 폴더 정리 (예: /Applications/NetautoBar.localized)
+  for p in /Applications/NetautoBar.localized /Applications/NetautoBar; do
+    if [ -d "$p" ] && [ -z "$(/usr/bin/find "$p" -name '*.app' -maxdepth 2 2>/dev/null)" ]; then
+      /bin/rm -rf "$p" 2>/dev/null && printf '  삭제  %s (빈 폴더)\n' "$p"
+    fi
+  done
+
+  # 정품 앱을 다시 등록해 Launchpad 를 갱신한다
+  if [ -d "$APP_CANONICAL" ] && [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$APP_CANONICAL" >/dev/null 2>&1
+    printf '\n  재등록 %s\n' "$APP_CANONICAL"
+  fi
+
+  # Dock 을 다시 띄워야 Launchpad 표시가 갱신된다
+  /usr/bin/killall Dock 2>/dev/null || true
+  printf '\n완료. Launchpad 에 하나만 남습니다.\n'
+}
+
 # ── 진단 ─────────────────────────────────────────────────────────────
 # "아이콘은 뜨는데 전환이 안 된다" 같은 상황의 원인을 한 번에 보여준다.
 # 이 출력을 그대로 복사해 보내면 원격에서 판단할 수 있다.
@@ -851,8 +939,9 @@ cmd_doctor() {
   if [ -z "$dev" ]; then
     printf '  (Wi-Fi 장치를 찾지 못해 확인할 수 없습니다)\n'
   else
-    for m in networksetup ipconfig scutil_str scutil_profile wdutil; do
+    for m in appfile networksetup ipconfig scutil_str scutil_profile wdutil; do
       case "$m" in
+        appfile)        v=$(ssid_via_appfile) ;;
         networksetup)   v=$(ssid_via_networksetup "$dev") ;;
         ipconfig)       v=$(ssid_via_ipconfig "$dev") ;;
         scutil_str)     v=$(ssid_via_scutil_str "$dev") ;;
@@ -869,14 +958,25 @@ cmd_doctor() {
       fi
     done
     printf '\n'
+    printf '\n  앱이 적어둔 값 : %s\n' "$(
+      if [ -r "$SSID_FILE" ]; then printf '%s초 전 기록' "$(appfile_age)"
+      else printf '없음 — 메뉴바 앱이 꺼져 있거나 위치 권한이 없습니다'; fi)"
+    printf '  메뉴바 앱     : %s\n\n' \
+      "$(/usr/bin/pgrep -x NetautoBar >/dev/null 2>&1 && echo '실행 중 ✓' || echo '실행 안 됨 ✗')"
+
     if v=$(detect_ssid_once "$dev"); then
       printf '  → 사용된 방법 : %s\n' "${v%%${SEP}*}"
       ssid="${v#*${SEP}}"
       printf '  → 감지된 SSID : %s\n' "$ssid"
     else
-      printf '  → 모든 방법 실패. Wi-Fi 이름을 읽을 수 없습니다.\n'
-      printf '     macOS 15 부터 SSID 읽기에 위치 서비스 권한이 필요합니다.\n'
-      printf '     시스템 설정 › 개인 정보 보호 및 보안 › 위치 서비스 를 확인하세요.\n'
+      printf '  → 모든 방법 실패. Wi-Fi 이름을 읽을 수 없습니다.\n\n'
+      printf '     macOS 15 부터 Wi-Fi 이름 읽기에 위치 권한이 필요하고,\n'
+      printf '     백그라운드 서비스(root)는 그 권한을 받을 수 없습니다.\n'
+      printf '     메뉴바 앱이 대신 읽어 넘기는 구조이므로:\n'
+      printf '       1. 메뉴바 아이콘을 눌러 앱이 실행 중인지 확인\n'
+      printf '       2. 패널의 "권한 허용하기" 를 눌러 위치 권한을 허용\n'
+      printf '       3. 시스템 설정 › 개인 정보 보호 및 보안 › 위치 서비스 에서\n'
+      printf '          NetautoBar 가 켜져 있는지 확인\n'
       ssid=""
     fi
   fi
@@ -965,6 +1065,7 @@ netauto — SSID 기반 macOS 네트워크 위치 자동 전환
   netauto off | on            완전 비활성 / 재활성 (sudo)
   netauto log [줄수]          로그 보기 (기본 40줄)
   netauto doctor              진단 — 왜 전환이 안 되는지 한 번에 확인
+  netauto cleanup             흩어진 앱 복사본·중복 등록 정리 (sudo 필요)
 
 설정: /usr/local/etc/netauto/config.json  (메뉴바 앱의 "설정…" 에서 편집)
 USAGE
@@ -986,6 +1087,7 @@ case "${1:-apply}" in
   log)    shift || true; cmd_log "${1:-40}" ;;
   ssids)  cmd_ssids ;;
   doctor) cmd_doctor ;;
+  cleanup) cmd_cleanup ;;
   version|--version|-v) echo "netauto $VERSION" ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;

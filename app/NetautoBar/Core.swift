@@ -7,6 +7,9 @@
 import Foundation
 import SwiftUI
 import AppKit
+import CoreWLAN
+import CoreLocation
+import Combine
 
 // MARK: - 설정 파일 (netauto 데몬과 공유하는 JSON)
 
@@ -321,17 +324,38 @@ final class Model: ObservableObject {
     @Published var knownSSIDs: [String] = []
     @Published var saveMessage: String?
 
+    /// Wi-Fi 이름을 대신 읽어 데몬에 넘긴다 (macOS 15+ 위치 권한 필요)
+    let wifi = WiFiMonitor()
+
     private var timer: Timer?
+    private var wifiObserver: AnyCancellable?
 
     init() {
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        // 앱이 읽은 이름이 바뀌면 곧바로 상태를 다시 읽는다
+        wifiObserver = wifi.objectWillChange.sink { [weak self] _ in
             guard let me = self else { return }
             Task { @MainActor in me.refresh() }
         }
+        refresh()
+        schedulePolling()
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
+            guard let me = self else { return }
+            Task { @MainActor in me.refresh() }
+        }
+    }
+
+    /// 패널이 열려 있으면 자주, 닫혀 있으면 드물게 갱신한다.
+    /// 상태 조회는 netauto 프로세스를 띄우므로 닫힌 동안의 빈도를 줄인다.
+    @Published var panelOpen = false {
+        didSet { if panelOpen != oldValue { schedulePolling(); if panelOpen { refresh() } } }
+    }
+
+    private func schedulePolling() {
+        timer?.invalidate()
+        let interval: TimeInterval = panelOpen ? 3 : 30
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let me = self else { return }
             Task { @MainActor in me.refresh() }
         }
@@ -570,6 +594,22 @@ final class Model: ObservableObject {
     /// SSID 를 읽지 못하는 상태인가 (macOS 15+ 위치 서비스 권한 문제)
     var cannotReadSSID: Bool { status.state == "nossid" }
 
+    /// 앱이 위치 권한을 못 받아 Wi-Fi 이름을 읽지 못하는 상태
+    var needsLocationPermission: Bool { wifi.needsAuthorization }
+
+    /// 위치 권한 상태를 사람이 읽는 문장으로
+    var locationStatusLabel: String {
+        if wifi.isAuthorized {
+            return wifi.ssid.map { "허용됨 · \($0)" } ?? "허용됨 · 이름 없음"
+        }
+        switch wifi.authStatus {
+        case .notDetermined: return "아직 요청하지 않음"
+        case .denied:        return "거부됨 — 설정에서 켜야 합니다"
+        case .restricted:    return "제한됨"
+        default:             return "확인 중"
+        }
+    }
+
     /// 위치 서비스 설정 창을 연다
     func openLocationSettings() {
         let urls = [
@@ -600,6 +640,13 @@ final class Model: ObservableObject {
         }
     }
 
+    /// 패널에 보여줄 Wi-Fi 이름. 데몬이 못 읽어도 앱이 읽은 값을 쓴다.
+    var displaySSID: String {
+        if let s = wifi.ssid, !s.isEmpty { return s }
+        if status.connected, !status.ssid.isEmpty { return status.ssid }
+        return status.state == "nowifi" ? "연결 없음" : "이름 확인 불가"
+    }
+
     var ipLabel: String {
         let addr = status.ipv4_address.isEmpty ? "—" : status.ipv4_address
         let cfg = status.ipv4_config
@@ -617,6 +664,137 @@ final class Model: ObservableObject {
 
     var isPaused: Bool { status.state == "paused" }
     var isDisabled: Bool { status.state == "disabled" }
+}
+
+// MARK: - Wi-Fi 이름 감시자
+
+/// macOS 15 부터 Wi-Fi 이름을 읽으려면 위치 서비스 권한이 필요하다.
+/// root 데몬은 그 권한을 받을 수 없어서 — macOS 26 에서는 wdutil 조차
+/// `<redacted>` 를 돌려준다 — 사용자 권한으로 도는 이 앱이 대신 읽어
+/// 데몬이 보는 파일에 적어 둔다.
+///
+/// 파일 형식 (2줄):
+///   1행: 기록 시각 (epoch 초)
+///   2행: Wi-Fi 이름 (읽지 못했으면 빈 줄)
+/// 데몬은 너무 오래된 값을 무시하므로, 앱이 꺼져 있으면 자동으로 폐기된다.
+@MainActor
+final class WiFiMonitor: NSObject, ObservableObject {
+    static let publishPath = "/usr/local/var/netauto/ssid"
+
+    @Published private(set) var ssid: String?
+    @Published private(set) var authStatus: CLAuthorizationStatus = .notDetermined
+    @Published private(set) var canPublish = true
+
+    private let location = CLLocationManager()
+    private let wifi = CWWiFiClient.shared()
+    private var timer: Timer?
+
+    override init() {
+        super.init()
+        location.delegate = self
+        // 위치 자체는 쓰지 않는다. 권한만 있으면 CoreWLAN 이 Wi-Fi 이름을 돌려준다.
+        location.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        authStatus = location.authorizationStatus
+        refresh()
+        // 앱 구동이 끝난 뒤에 요청해야 대화상자가 유실되지 않는다.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.requestAuthorizationIfNeeded()
+        }
+        // 15초마다 확인한다. 데몬은 90초까지 유효하게 보므로 충분히 여유 있고,
+        // CoreWLAN 조회는 프로세스를 띄우지 않아 비용이 거의 없다.
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            guard let me = self else { return }
+            Task { @MainActor in me.refresh() }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let me = self else { return }
+            Task { @MainActor in me.refresh() }
+        }
+    }
+
+    var isAuthorized: Bool {
+        authStatus == .authorizedAlways
+    }
+
+    var needsAuthorization: Bool {
+        !isAuthorized && ssid == nil
+    }
+
+    /// 아직 묻지 않았다면 한 번 요청한다.
+    /// LSUIElement 앱은 활성 상태가 아니면 대화상자가 뜨지 않을 수 있고,
+    /// macOS 에 따라 실제로 위치 사용을 시작해야 프롬프트가 나오므로 둘 다 한다.
+    func requestAuthorizationIfNeeded() {
+        guard authStatus == .notDetermined else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        location.requestAlwaysAuthorization()
+        location.startUpdatingLocation()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.location.stopUpdatingLocation()
+        }
+    }
+
+    /// 권한 요청. 이미 거부된 상태면 설정 창을 여는 수밖에 없다.
+    func requestAuthorization() {
+        switch authStatus {
+        case .notDetermined:
+            requestAuthorizationIfNeeded()
+        case .denied, .restricted:
+            openLocationSettings()
+        default:
+            refresh()
+        }
+    }
+
+    func openLocationSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices",
+        ]
+        for c in candidates {
+            if let u = URL(string: c), NSWorkspace.shared.open(u) { return }
+        }
+    }
+
+    func refresh() {
+        let name = wifi.interface()?.ssid()
+        ssid = (name?.isEmpty == false) ? name : nil
+        publish()
+    }
+
+    /// 진단용 권한 상태 문자열
+    var authText: String {
+        switch authStatus {
+        case .notDetermined:    return "notDetermined"
+        case .restricted:       return "restricted"
+        case .denied:           return "denied"
+        case .authorizedAlways: return "authorizedAlways"
+        @unknown default:       return "unknown(\(authStatus.rawValue))"
+        }
+    }
+
+    private func publish() {
+        // 3행에 권한 상태를 함께 적는다 (데몬은 1~2행만 읽으므로 호환된다)
+        let payload = "\(Int(Date().timeIntervalSince1970))\n\(ssid ?? "")\n\(authText)\n"
+        do {
+            try payload.write(toFile: Self.publishPath, atomically: true, encoding: .utf8)
+            canPublish = true
+        } catch {
+            // 데몬이 설치되지 않았거나 디렉터리 권한이 없으면 쓸 수 없다
+            canPublish = false
+        }
+    }
+}
+
+extension WiFiMonitor: CLLocationManagerDelegate {
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        Task { @MainActor in
+            self.authStatus = status
+            self.refresh()
+        }
+    }
 }
 
 // MARK: - 프로필 아이콘 선택 목록

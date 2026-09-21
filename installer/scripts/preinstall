@@ -41,6 +41,27 @@ cleanup_stale() { # $1=plist 디렉터리  $2=launchd 도메인
 cleanup_stale /Library/LaunchDaemons system
 [ -n "$uid" ] && [ "$uid" != "0" ] && cleanup_stale /Library/LaunchAgents "gui/$uid"
 
+# 개발 중 빌드하거나 설치 프로그램이 엉뚱한 곳에 복사한 앱을 정리한다.
+# Launch Services 는 경로마다 따로 등록하므로, 남아 있으면 Launchpad 에
+# 같은 앱이 여러 개로 보인다.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+if [ -x "$LSREGISTER" ]; then
+  "$LSREGISTER" -dump 2>/dev/null \
+    | /usr/bin/grep -oE '/[^[:space:]]*NetautoBar\.app' \
+    | /usr/bin/sort -u \
+    | while IFS= read -r stray; do
+        [ -n "$stray" ] || continue
+        [ "$stray" = "$APP" ] && continue
+        "$LSREGISTER" -u "$stray" >/dev/null 2>&1 || true
+        /bin/rm -rf "$stray" 2>/dev/null || true
+      done
+fi
+# 앱이 빠진 래퍼 폴더도 정리
+for wrapper in /Applications/NetautoBar.localized; do
+  [ -d "$wrapper" ] && [ -z "$(/usr/bin/find "$wrapper" -maxdepth 2 -name '*.app' 2>/dev/null)" ] \
+    && /bin/rm -rf "$wrapper" 2>/dev/null || true
+done
+
 # 예전 설치 기록도 지운다 (그대로 두면 업그레이드가 아니라 별개 설치로 남는다)
 if [ -e "$BIN" ]; then
   /usr/sbin/pkgutil --file-info "$BIN" 2>/dev/null \

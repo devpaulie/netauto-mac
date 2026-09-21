@@ -209,23 +209,30 @@ Run **`netauto doctor`** first. It prints the macOS version, the Wi-Fi device,
 validity, the rule verdict, service registration and the recent log — everything
 needed to tell what's wrong. Paste that output into an [issue](../../issues).
 
-### Nothing switches on macOS 15 (Sequoia) or later
+### Nothing switches on macOS 15 (Sequoia) or macOS 26 (Tahoe)
 
-Since macOS 15, **reading the Wi-Fi name requires Location Services**. Without the
-name there's no rule to match, so the icon appears but nothing ever changes.
+Since macOS 15, **reading the Wi-Fi name requires Location permission**. A root
+background service cannot hold that permission — on macOS 26 even `wdutil` returns
+`<redacted>`. The daemon alone simply cannot see the network name.
 
-If every entry under `[SSID 감지]` in `netauto doctor` is `✗`, that's this. netauto
-tries five paths in order:
+So netauto splits the job:
 
-| Method | Note |
-|---|---|
-| `networksetup -getairportnetwork` | fastest; may be gated on macOS 15+ |
-| `ipconfig getsummary` | SSID field |
-| `scutil` `SSID_STR` | already redacted on some 14.x systems |
-| `scutil` `ProfileID` hex decode | the name survives here as hex |
-| `wdutil info` | real value only as root (the daemon is root) |
+```
+Menu bar app (your account)        Background service (root)
+  CoreWLAN + Location grant   →     /usr/local/var/netauto/ssid
+  reads the Wi-Fi name              reads it and applies rules
+```
 
-The panel also shows a warning with an **Open Location Services settings** button.
+The app writes the name every 5 seconds; the daemon discards anything older than
+90 seconds. **If the app isn't running, there's no Wi-Fi name and switching stops.**
+
+Check, in order:
+
+1. Is the icon in the menu bar? (absent means the app isn't running)
+2. If the panel shows a Location permission banner, click **권한 허용하기**
+3. System Settings › Privacy & Security › Location Services — enable **NetautoBar**
+4. Confirm `netauto doctor` shows `appfile : ✓`
+
 
 ---
 

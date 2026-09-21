@@ -142,7 +142,7 @@ struct PanelView: View {
                 notInstalled
             } else {
                 header
-                if model.cannotReadSSID {
+                if model.cannotReadSSID || model.needsLocationPermission {
                     separator
                     ssidWarning
                 }
@@ -160,7 +160,8 @@ struct PanelView: View {
         }
         .frame(width: UX.panelWidth)
         .background(UX.background)      // 반투명 배경의 대비 문제를 없앤다
-        .onAppear { model.refresh() }
+        .onAppear { model.panelOpen = true }
+        .onDisappear { model.panelOpen = false }
     }
 
     // macOS 15 부터 Wi-Fi 이름 읽기에 위치 서비스 권한이 필요하다.
@@ -168,18 +169,25 @@ struct PanelView: View {
     private var ssidWarning: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Image(systemName: "exclamationmark.triangle.fill")
+                Image(systemName: "location.slash.fill")
                     .font(.system(size: 12)).foregroundStyle(.orange)
-                Text("Wi-Fi 이름을 읽을 수 없습니다")
+                Text("위치 권한이 필요합니다")
                     .font(.system(size: UX.rowSize, weight: .semibold))
             }
-            Text("macOS 15 부터 Wi-Fi 이름을 읽으려면 위치 서비스가 켜져 있어야 합니다. 이름을 모르면 규칙을 적용할 수 없습니다.")
+            Text("macOS 15 부터 Wi-Fi 이름을 읽으려면 위치 권한이 있어야 합니다. 백그라운드 서비스는 이 권한을 받을 수 없어서, 이 앱이 대신 읽어 전달합니다. 허용하지 않으면 어떤 Wi-Fi인지 알 수 없어 규칙이 동작하지 않습니다.")
                 .font(.system(size: UX.capSize))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("위치 서비스 설정 열기") { model.openLocationSettings() }
-                .buttonStyle(.link)
+
+            HStack(spacing: 10) {
+                Button(model.wifi.authStatus == .notDetermined ? "권한 허용하기" : "위치 서비스 설정 열기") {
+                    model.wifi.requestAuthorization()
+                }
                 .font(.system(size: UX.capSize))
+                Text(model.locationStatusLabel)
+                    .font(.system(size: UX.capSize))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, UX.hPad)
     }
@@ -224,7 +232,7 @@ struct PanelView: View {
     // ── 현재 상태: Grid 로 열을 맞춘다 (공백 정렬은 가변폭에서 어긋난다) ──
     private var infoGrid: some View {
         Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 5) {
-            infoRow("Wi-Fi", model.status.connected ? model.status.ssid : "연결 없음")
+            infoRow("Wi-Fi", model.displaySSID)
             infoRow("IP", model.ipLabel)
             infoRow("프록시", model.proxyLabel)
             if model.ruleMismatch {

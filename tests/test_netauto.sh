@@ -264,6 +264,37 @@ has   "가려진 값은 거부" "이름을 읽을 수 없음" "$(logtail)"
 check "가려진 값으로 전환하지 않음" "" "$(switched)"
 
 echo
+echo "── 8c. 앱이 넘겨주는 SSID (macOS 15+ 유일한 경로) ────────────"
+# macOS 15+ 에서는 데몬이 어떤 방법으로도 SSID 를 읽을 수 없다.
+# 사용자 권한으로 도는 앱이 CoreWLAN 으로 읽어 파일에 적어주고, 데몬은 그걸 쓴다.
+reset
+printf '%s\nOfficeWiFi\nauthorizedAlways\n' "$(date +%s)" > "$TMP/state/ssid"
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_LOCATION=Automatic run apply)
+check "앱이 적어준 이름으로 전환" "Office" "$(switched)"
+reset
+# 시스템 방법이 살아 있어도 앱 값을 먼저 쓴다 (가장 신뢰할 수 있는 출처)
+printf '%s\nOfficeWiFi\n' "$(date +%s)" > "$TMP/state/ssid"
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="MSK 2G" MOCK_LOCATION=Automatic run apply)
+check "앱 값이 시스템 방법보다 우선" "Office" "$(switched)"
+reset
+# 앱이 꺼져 오래된 값이 남아 있으면 쓰지 않는다 (엉뚱한 프로필 적용 방지)
+printf '%s\nOfficeWiFi\n' "$(( $(date +%s) - 600 ))" > "$TMP/state/ssid"
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_LOCATION=Automatic run apply)
+has   "오래된 값은 버린다" "이름을 읽을 수 없음" "$(logtail)"
+check "오래된 값으로 전환하지 않음" "" "$(switched)"
+reset
+# 앱은 살아 있지만 권한이 없어 이름이 빈 경우
+printf '%s\n\nnotDetermined\n' "$(date +%s)" > "$TMP/state/ssid"
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_LOCATION=Automatic run apply)
+has   "이름이 비면 감지 실패로 다룬다" "이름을 읽을 수 없음" "$(logtail)"
+check "빈 이름으로 전환하지 않음" "" "$(switched)"
+reset
+# 깨진 파일은 무시한다
+printf 'not-a-timestamp\nOfficeWiFi\n' > "$TMP/state/ssid"
+out=$(AS_ROOT=1 MOCK_POWER=On MOCK_SSID="" MOCK_LOCATION=Automatic run apply)
+check "깨진 파일로 전환하지 않음" "" "$(switched)"
+
+echo
 echo "── 9. 없는 위치를 가리키는 규칙 ──────────────────────────────"
 reset
 printf '{"options":{"notify":false,"ssid_retry":1},"rules":[{"ssid":"ghostnet","location":"NoSuchLocation","ip_mode":"keep","ip":""},{"ssid":"*","location":"Automatic","ip_mode":"keep","ip":""}]}' > "$TMP/netauto.bad.json"

@@ -54,6 +54,14 @@ echo "▸ Info.plist"
 	<key>LSUIElement</key><true/>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSHumanReadableCopyright</key><string>netauto — by devpaulie</string>
+	<!-- macOS 15 부터 Wi-Fi 이름을 읽으려면 위치 권한이 필요하다.
+	     백그라운드 서비스는 이 권한을 받을 수 없어서 앱이 대신 읽는다. -->
+	<key>NSLocationUsageDescription</key>
+	<string>지금 연결된 Wi-Fi 이름을 확인해 알맞은 네트워크 프로필로 전환하기 위해 필요합니다. 위치를 수집하거나 어디에도 보내지 않습니다.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>지금 연결된 Wi-Fi 이름을 확인해 알맞은 네트워크 프로필로 전환하기 위해 필요합니다. 위치를 수집하거나 어디에도 보내지 않습니다.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Wi-Fi 가 바뀔 때마다 이름을 확인해 프로필을 전환하려면 항상 허용이 필요합니다. 위치를 수집하거나 어디에도 보내지 않습니다.</string>
 </dict>
 </plist>
 PLIST

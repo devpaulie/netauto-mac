@@ -38,4 +38,10 @@ if [ -n "$uid" ] && [ "$uid" != "0" ]; then
   /bin/launchctl enable "gui/$uid/$AGENT"
 fi
 
+# Launchpad 표시를 갱신한다 (정품 경로 재등록 + Dock 재시작)
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+[ -x "$LSREGISTER" ] && [ -d /Applications/NetautoBar.app ] \
+  && "$LSREGISTER" -f /Applications/NetautoBar.app >/dev/null 2>&1 || true
+/usr/bin/killall Dock 2>/dev/null || true
+
 exit 0
